@@ -20,9 +20,10 @@ log = logging.getLogger(__name__)
 
 MODEL_ID    = "laion/larger_clap_general"
 SR          = 48_000
-CLIP_PRE    = 0.06
-CLIP_POST   = 0.45
-MIN_GAP     = 0.07
+CLIP_PRE      = 0.06   # seconds of pre-roll before onset
+CLIP_POST_MIN = 0.06   # shortest allowed post-roll
+CLIP_POST_MAX = 0.45   # longest allowed post-roll
+MIN_GAP       = 0.07   # minimum gap between onsets
 MAX_CLIPS   = 150
 BATCH_SIZE  = 32
 MAX_SECS    = 90
@@ -74,14 +75,21 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
 # ── Prototype computation ──────────────────────────────────────────────────────
 
 def _load_wav_files(paths) -> list[np.ndarray]:
-    """Load, trim, and fixed-length-pad a list of wav paths."""
+    """Load and silence-trim reference audio files.
+
+    No length truncation — reference sounds should be embedded in full so
+    CLAP sees the complete timbre, not an arbitrary slice of it.
+    The processor handles variable-length input via internal padding/truncation
+    (max ~10s for laion/larger_clap_general).
+    """
     clips = []
     for p in paths:
         try:
             audio, _ = librosa.load(str(p), sr=SR, mono=True)
             audio, _ = librosa.effects.trim(audio, top_db=30)
-            target   = int(CLIP_POST * SR)
-            audio    = audio[:target] if len(audio) > target else np.pad(audio, (0, target - len(audio)))
+            if len(audio) == 0:
+                log.warning(f"    Skipping {p.name}: empty after trim")
+                continue
             clips.append(audio)
         except Exception as e:
             log.warning(f"    Skipping {p.name}: {e}")
@@ -220,7 +228,7 @@ def detect_onsets(audio: np.ndarray) -> np.ndarray:
         return np.array([], dtype=int)
 
     if len(deduped) > MAX_CLIPS:
-        clip_len = int((CLIP_PRE + CLIP_POST) * SR)
+        clip_len = int((CLIP_PRE + CLIP_POST_MAX) * SR)
         energies = [float(np.sqrt(np.mean(audio[max(0, s-int(CLIP_PRE*SR)) : max(0, s-int(CLIP_PRE*SR))+clip_len]**2))) for s in deduped]
         order    = np.argsort(energies)[::-1][:MAX_CLIPS]
         deduped  = [deduped[i] for i in sorted(order)]
@@ -229,21 +237,40 @@ def detect_onsets(audio: np.ndarray) -> np.ndarray:
 
 
 def extract_clips(audio: np.ndarray, onsets: np.ndarray):
-    pre      = int(CLIP_PRE * SR)
-    clip_len = int((CLIP_PRE + CLIP_POST) * SR)
+    """Extract variable-length clips, each ending just before the next onset.
+
+    For onset i the post-roll is:
+        clip_post = clamp(next_onset - onset - CLIP_PRE, CLIP_POST_MIN, CLIP_POST_MAX)
+
+    Subtracting CLIP_PRE from the gap ensures this clip's tail ends exactly
+    where the next clip's pre-roll begins — no audio is shared between clips.
+    For the last onset (no successor) we use CLIP_POST_MAX.
+    """
+    pre_samp     = int(CLIP_PRE * SR)
+    post_min     = int(CLIP_POST_MIN * SR)
+    post_max     = int(CLIP_POST_MAX * SR)
     clips, times = [], []
-    for onset in onsets:
-        start = max(0, onset - pre)
-        end   = start + clip_len
-        if end > len(audio):
-            end, start = len(audio), max(0, len(audio) - clip_len)
-        clip = audio[start:end].copy()
+
+    for i, onset in enumerate(onsets):
+        # How much room until the next onset's pre-roll begins?
+        if i + 1 < len(onsets):
+            gap      = int(onsets[i + 1]) - int(onset) - pre_samp
+            post_smp = int(np.clip(gap, post_min, post_max))
+        else:
+            post_smp = post_max
+
+        start    = max(0, onset - pre_samp)
+        end      = min(len(audio), onset + post_smp)
+        clip_len = end - start
+        clip     = audio[start:end].copy()
         if len(clip) < clip_len:
             clip = np.pad(clip, (0, clip_len - len(clip)))
         peak = np.max(np.abs(clip))
         if peak > 1e-6:
             clip = clip / peak * 0.9
-        clips.append(clip); times.append(float(start) / SR)
+        clips.append(clip)
+        times.append(float(start) / SR)
+
     return clips, times
 
 # ── Route ──────────────────────────────────────────────────────────────────────

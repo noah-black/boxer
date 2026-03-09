@@ -1,21 +1,36 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// DRUM EXTRACTOR — p5.js sketch
+// BOXER — drum extractor + polymetric sequencer
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BACKEND = 'http://localhost:8000';
 
 const DRUMS = [
-  { id: 'kick',  label: 'KICK',   sub: 'bass drum', kbd: 'K', hue: 8   },
-  { id: 'snare', label: 'SNARE',  sub: 'backbeat',  kbd: 'S', hue: 200 },
-  { id: 'hihat', label: 'HI-HAT', sub: 'closed',    kbd: 'H', hue: 48  },
-  { id: 'clap',  label: 'CLAP',   sub: 'hand clap', kbd: 'C', hue: 300 },
+  { id: 'kick',  label: 'KICK',   sub: 'bass drum', kbd: 'A', hue: 10  },
+  { id: 'hihat', label: 'HI-HAT', sub: 'closed',    kbd: 'S', hue: 42  },
+  { id: 'snare', label: 'SNARE',  sub: 'backbeat',  kbd: 'D', hue: 205 },
+  { id: 'clap',  label: 'CLAP',   sub: 'hand clap', kbd: 'F', hue: 295 },
+];
+
+const GRIDS = [
+  { steps: 16 },
+  { steps: 12 },
+  { steps: 10 },
+  { steps: 14 },
 ];
 
 // ── Palette ───────────────────────────────────────────────────────────────────
-const BG    = [237, 14,  5];
-const AMBER = [40,  90, 96];
-const DIM   = [237, 10, 35];
-const GRID  = [237, 12, 14];
+// Light pastel theme — warm cream ground, white panels, fine-tip-pen borders
+const BG        = [38, 14, 93];    // warm cream
+const PANEL     = [0,   0, 100];   // white
+const INK       = [0,   0,   8];   // near-black (borders + primary text)
+const INK_DIM   = [0,   0,  48];   // secondary text
+const INK_FAINT = [0,   0,  72];   // tertiary / placeholders
+const ACCENT    = [38, 80,  78];   // amber gold (buttons, highlights)
+
+// Per-drum: vivid but works on white
+// s and b tuned so each reads clearly against both white panels and BG
+const DRUM_S = 72, DRUM_B = 62;    // saturation, brightness for filled cells
+const DRUM_S_LITE = 38, DRUM_B_LITE = 88; // tint for empty cells / backgrounds
 
 // ── App state ─────────────────────────────────────────────────────────────────
 let phase = 'idle';
@@ -30,25 +45,32 @@ let padFlash       = {};
 let padHeld        = {};
 let drag           = null;
 
-// ── Sequencer state ───────────────────────────────────────────────────────────
-let seqSteps       = 16;
+// Sequencer
+let seqGrid        = [];
 let seqBPM         = 120;
 let seqPlaying     = false;
 let seqRecording   = false;
-let seqGrid        = {};
-let seqCurrentStep = 0;
-
-// Lookahead scheduler
 let scheduleTimer  = null;
-let _schedStep     = 0;
-let _nextNoteTime  = 0;
-let _loopStartTime = 0;     // audioCtx time when step 0 of current loop began
+let _loopStartTime = 0;
+let _nextSteps     = [];
 const LOOKAHEAD_MS   = 25;
 const SCHEDULE_AHEAD = 0.10;
 
-// Tap tempo
-let tapTimes    = [];
-let seqGrouping = 4;    // steps per visual group (beat division)
+let tapTimes = [];
+
+// ── Layout constants ──────────────────────────────────────────────────────────
+const PAD_H         = 148;
+const TRIM_H        = 18;
+const TRIM_GAP      = 7;
+const SEQ_ROW_H_MIN = 17;
+const SEQ_ROW_H_MAX = 36;
+const GRID_GAP      = 8;
+const SEQ_CTRL_H    = 40;
+const FOOTER_H      = 26;
+const HEADER_H      = 52;
+const SEQ_MARGIN    = 56;
+const SEQ_LABEL_W   = 72;   // wide enough for bold drum labels
+const R             = 5;    // global corner radius
 
 // Web Audio / recording
 let audioCtx      = null;
@@ -58,58 +80,22 @@ let recStream     = null;
 let recStart      = 0;
 let analyserNode  = null;
 let waveformData  = null;
-
-// HTML elements
-let uploadEl   = null;
-let stepsInput = null;
+let uploadEl      = null;
 
 let errorMsg  = '';
 let statusMsg = '';
 let spinAngle = 0;
 
-// ── Layout constants ──────────────────────────────────────────────────────────
-const PAD_H      = 178;
-const TRIM_H     = 20;
-const TRIM_GAP   = 8;
-const SEQ_ROW_H  = 26;
-const SEQ_CTRL_H = 40;
-const FOOTER_H   = 28;
-const HEADER_H   = 50;
-const MIN_CELL_W = 8;    // minimum px per step cell — determines max steps
-const SEQ_LABEL_W = 52;
-const SEQ_MARGIN  = 60;
-
-// ── p5 setup ──────────────────────────────────────────────────────────────────
+// ── Setup ─────────────────────────────────────────────────────────────────────
 
 function setup() {
   createCanvas(windowWidth, windowHeight);
   colorMode(HSB, 360, 100, 100, 100);
   textFont('IBM Plex Mono');
 
-  audioCtx   = new (window.AudioContext || window.webkitAudioContext)();
-  uploadEl   = select('#upload-input');
-  stepsInput = select('#steps-input');
-
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  uploadEl = select('#upload-input');
   uploadEl.changed(onFileSelected);
-
-  // Validate and apply only when user signals they're done (blur or Enter)
-  // — avoids rejecting partial input like the "2" in "28"
-  function applyStepsInput() {
-    const v = parseInt(stepsInput.value());
-    if (isNaN(v)) { stepsInput.value(seqSteps); return; }
-    const maxSteps = calcMaxSteps();
-    const clamped  = constrain(v, 3, maxSteps);
-    stepsInput.value(clamped);
-    if (clamped !== seqSteps) setStepCount(clamped);
-  }
-  stepsInput.elt.addEventListener('blur',   applyStepsInput);
-  stepsInput.elt.addEventListener('keydown', e => {
-    e.stopPropagation();
-    if (e.key === 'Enter') { applyStepsInput(); stepsInput.elt.blur(); }
-  });
-
-  // Prevent spacebar / letter keys from bubbling when input is focused
-  stepsInput.elt.addEventListener('keydown', e => e.stopPropagation());
 
   DRUMS.forEach(d => {
     padFlash[d.id]       = -9999;
@@ -119,33 +105,35 @@ function setup() {
     drumTrimEnd[d.id]    = 1;
     drumCandidates[d.id] = [];
     drumIdx[d.id]        = 0;
-    seqGrid[d.id]        = new Array(seqSteps).fill(false);
-
     const g = audioCtx.createGain();
     g.gain.value = 0.8;
     g.connect(audioCtx.destination);
     gainNodes[d.id] = g;
   });
+
+  GRIDS.forEach((g, gi) => {
+    seqGrid[gi] = {};
+    _nextSteps[gi] = 0;
+    DRUMS.forEach(d => { seqGrid[gi][d.id] = new Array(g.steps).fill(false); });
+  });
 }
 
-function windowResized() {
-  resizeCanvas(windowWidth, windowHeight);
-  positionStepsInput();
+function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
+// ── Timing ────────────────────────────────────────────────────────────────────
+
+function loopDuration()  { return 4 * (60.0 / seqBPM); }
+function loopFraction()  {
+  if (!seqPlaying) return 0;
+  return ((audioCtx.currentTime - _loopStartTime) % loopDuration()) / loopDuration();
 }
 
-function calcMaxSteps() {
-  const seqW = width - SEQ_MARGIN*2 - SEQ_LABEL_W;
-  return max(3, floor(seqW / MIN_CELL_W));
-}
-
-// ── Main draw loop ────────────────────────────────────────────────────────────
+// ── Draw ──────────────────────────────────────────────────────────────────────
 
 function draw() {
   background(...BG);
-  drawBgGrid();
   drawHeader();
   spinAngle += 0.04;
-
   switch (phase) {
     case 'idle':       drawIdle();       break;
     case 'recording':  drawRecording();  break;
@@ -155,167 +143,174 @@ function draw() {
   }
 }
 
-// ── Background grid ───────────────────────────────────────────────────────────
-
-function drawBgGrid() {
-  stroke(...GRID); strokeWeight(0.5);
-  for (let i=0;i<=24;i++) line(map(i,0,24,0,width),0,map(i,0,24,0,width),height);
-  for (let j=0;j<=16;j++) line(0,map(j,0,16,0,height),width,map(j,0,16,0,height));
-}
+// ── Header ────────────────────────────────────────────────────────────────────
 
 function drawHeader() {
-  noStroke();
-  fill(...AMBER); textSize(11); textStyle(NORMAL); textAlign(LEFT,TOP);
-  text('DRUM EXTRACTOR  v0.1', 28, 24);
-  fill(...DIM); textSize(9); textAlign(RIGHT,TOP);
-  text('CLAP / laion · ' + (phase==='ready'?'READY':phase.toUpperCase()), width-28, 24);
-  stroke(...DIM); strokeWeight(0.5); line(28,42,width-28,42);
+  // Header panel
+  fill(...PANEL); stroke(...INK); strokeWeight(1);
+  rect(0, 0, width, HEADER_H);
+
+  // BOXER wordmark
+  textFont('Orbitron');
+  textStyle(BOLD); textSize(22); textAlign(LEFT, CENTER);
+  fill(...INK); noStroke();
+  text('BOXER', 24, HEADER_H / 2);
+  textFont('IBM Plex Mono');
+
+
 }
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
 
 function getPadLayout() {
-  const n    = DRUMS.length;
-  const gap  = 16;
-  const padW = min(140, (width - 80 - gap*(n-1)) / n);
+  const n    = DRUMS.length, gap = 14;
+  const padW = min(136, (width - 80 - gap*(n-1)) / n);
   const total = padW*n + gap*(n-1);
-  const startX = (width - total) / 2;
-  const padY   = HEADER_H + 10 + TRIM_H + TRIM_GAP;
-  return { padW, padH: PAD_H, gap, startX, padY };
+  return {
+    padW, padH: PAD_H, gap,
+    startX: (width - total) / 2,
+    padY: HEADER_H + 12 + TRIM_H + TRIM_GAP,
+  };
 }
 
 function getSeqLayout() {
   const { padY } = getPadLayout();
-  const seqTop  = padY + PAD_H + 16;
+  const seqTop  = padY + PAD_H + 14;
   const seqW    = width - SEQ_MARGIN*2 - SEQ_LABEL_W;
-  const ctrlY   = seqTop;
   const gridTop = seqTop + SEQ_CTRL_H;
-  return { seqTop, margin: SEQ_MARGIN, labelW: SEQ_LABEL_W, seqW, ctrlY, gridTop };
+  const totalRows = GRIDS.length * DRUMS.length;
+  const totalGaps = GRIDS.length - 1;
+  const available = height - gridTop - FOOTER_H - 10;
+  const rowH = constrain(
+    floor((available - totalGaps * GRID_GAP) / totalRows),
+    SEQ_ROW_H_MIN, SEQ_ROW_H_MAX
+  );
+  return {
+    seqTop, seqW, rowH,
+    ctrlY:    seqTop,
+    gridTop,
+    gridLeft: SEQ_MARGIN + SEQ_LABEL_W,
+  };
 }
 
-// Position the HTML steps input over the canvas
-function positionStepsInput() {
-  if (phase !== 'ready') { stepsInput.hide(); return; }
-  const { seqTop, margin, labelW, seqW } = getSeqLayout();
-  const ctrlMid = seqTop + SEQ_CTRL_H/2;
-
-  // Place it after the step-count label — we'll compute this the same way
-  // as the draw function lays out controls
-  const playX      = margin + labelW;
-  const bpmLabelX  = playX + 13 + 14;
-  const bpmSliderX = bpmLabelX + 28;
-  const tapX       = bpmSliderX + 110 + 36;
-  const tapW       = 38;
-  const stepLabelX = tapX + tapW + 20;
-  const inputX     = stepLabelX + 38;
-  const inputY     = ctrlMid - 10;
-
-  stepsInput.style('left',  inputX + 'px');
-  stepsInput.style('top',   inputY + 'px');
-  stepsInput.show();
+function gridY(gi, gridTop, rowH) {
+  return gridTop + gi * (DRUMS.length * rowH + GRID_GAP);
 }
 
-// ── IDLE ──────────────────────────────────────────────────────────────────────
-
-function drawIdle() {
-  stepsInput.hide();
-  const cx=width/2, cy=height/2-20;
-  const breathe=sin(frameCount*0.035)*0.5+0.5;
-  noFill(); stroke(...AMBER,map(breathe,0,1,8,22)); strokeWeight(1);
-  circle(cx,cy,200+breathe*16);
-
-  const r=54, hov=dist(mouseX,mouseY,cx,cy)<r;
-  strokeWeight(1.5); stroke(...AMBER,hov?90:55); fill(0,0,hov?12:8);
-  circle(cx,cy,r*2);
-
-  noStroke(); fill(...AMBER,hov?95:70);
-  const mw=14,mh=22,mTop=cy-mh/2-4;
-  rectMode(CORNER); rect(cx-mw/2,mTop+mw/2,mw,mh-mw/2); ellipse(cx,mTop+mw/2,mw,mw);
-  noFill(); stroke(...AMBER,hov?95:70); strokeWeight(2);
-  const arcY=cy+mh/2-2;
-  arc(cx,arcY-2,24,16,PI,TWO_PI);
-  line(cx,arcY+6,cx,arcY+12); line(cx-8,arcY+12,cx+8,arcY+12);
-
-  noStroke(); fill(...AMBER,hov?90:55); textSize(10); textStyle(NORMAL); textAlign(CENTER);
-  text('CLICK TO RECORD',cx,cy+r+20);
-  const upY=cy+r+38, hovUp=abs(mouseX-cx)<70&&abs(mouseY-upY)<10;
-  fill(...DIM,hovUp?80:50); textSize(9); text('or upload a file',cx,upY);
-  cursor(hov||hovUp?HAND:ARROW);
-}
-
-// ── RECORDING ─────────────────────────────────────────────────────────────────
-
-function drawRecording() {
-  stepsInput.hide();
-  const cx=width/2, cy=height/2-30;
-  for(let i=0;i<3;i++){
-    const p=(frameCount*0.04+i*0.8)%TWO_PI;
-    noFill(); stroke(0,90,85,map(sin(p),-1,1,5,30-i*8)); strokeWeight(1);
-    circle(cx,cy,(90+i*28+sin(p)*8)*2);
-  }
-  const r=50, hov=dist(mouseX,mouseY,cx,cy)<r;
-  stroke(0,80,85,hov?90:65); strokeWeight(1.5); fill(0,0,hov?10:6); circle(cx,cy,r*2);
-  noStroke(); fill(0,80,85); rectMode(CENTER); rect(cx,cy,18,18,2); rectMode(CORNER);
-
-  const elapsed=((millis()-recStart)/1000).toFixed(1);
-  fill(0,80,frameCount%40<20?90:50); textSize(10); textAlign(CENTER);
-  text(`● REC  ${elapsed}s`,cx,cy+r+20);
-
-  if(analyserNode&&waveformData){
-    analyserNode.getByteTimeDomainData(waveformData);
-    const ww=min(480,width-80),wh=56,wx=(width-ww)/2,wy=cy+r+36;
-    noFill(); stroke(...DIM,40); strokeWeight(0.5); rect(wx,wy,ww,wh);
-    stroke(...DIM,25); line(wx,wy+wh/2,wx+ww,wy+wh/2);
-    stroke(40,85,96); strokeWeight(1.5); noFill(); beginShape();
-    for(let i=0;i<waveformData.length;i++) vertex(wx+map(i,0,waveformData.length-1,0,ww),wy+map(waveformData[i],0,255,wh,0));
-    endShape();
-  }
-  fill(...DIM,60); noStroke(); textSize(9); textAlign(CENTER);
-  text('CLICK TO STOP & ANALYSE',cx,height-36);
-  cursor(hov?HAND:ARROW);
-}
-
-// ── PROCESSING ────────────────────────────────────────────────────────────────
-
-function drawProcessing() {
-  stepsInput.hide();
-  const cx=width/2,cy=height/2-20,ticks=16;
-  for(let i=0;i<ticks;i++){
-    const a=(i/ticks)*TWO_PI+spinAngle;
-    stroke(...AMBER,pow(((i/ticks+spinAngle/TWO_PI)%1),1.5)*70+5); strokeWeight(1.5);
-    line(cx+cos(a)*40,cy+sin(a)*40,cx+cos(a)*54,cy+sin(a)*54);
-  }
-  noStroke(); fill(...AMBER,50); circle(cx,cy,8);
-  fill(...AMBER,80); textSize(11); textAlign(CENTER);
-  text(statusMsg||'ANALYSING…',cx,cy+72);
-  fill(...DIM,50); textSize(9);
-  text('running CLAP embeddings — may take 15–40 s',cx,cy+88);
-}
-
-// ── READY ─────────────────────────────────────────────────────────────────────
-
-function drawReady() {
-  positionStepsInput();
-  drawPads();
-  drawSequencer();
-}
-
-// ── Sub-region helpers ────────────────────────────────────────────────────────
+// ── Sub-regions ───────────────────────────────────────────────────────────────
 
 function trimBarRegion(x, padY, padW) {
   return { x, y: padY-TRIM_H-TRIM_GAP, w: padW, h: TRIM_H };
 }
 function volStripRegion(x, padY, padW) {
-  return { x: x+10, y: padY+PAD_H-24, w: padW-20, h: 9 };
+  return { x: x+9, y: padY+PAD_H-22, w: padW-18, h: 8 };
 }
 function swapBtnRegion(x, padY, padW) {
-  return { x: x+padW-20, y: padY+8, w: 13, h: 13 };
+  return { x: x+padW-18, y: padY+7, w: 13, h: 13 };
 }
 function trimHandleX(x, padW, id) {
   return {
     startPx: x + drumTrimStart[id]*padW,
     endPx:   x + drumTrimEnd[id]*padW,
   };
+}
+// Clear button for each grid — sits at right edge of label column
+function clearBtnRegion(gi, gridTop, rowH) {
+  const gTop = gridY(gi, gridTop, rowH);
+  const gridH = DRUMS.length * rowH;
+  return {
+    x: SEQ_MARGIN + SEQ_LABEL_W - 26,
+    y: gTop + gridH/2 - 9,
+    w: 22, h: 18,
+  };
+}
+
+// ── IDLE ──────────────────────────────────────────────────────────────────────
+
+function drawIdle() {
+  const cx = width/2, cy = height/2 - 10;
+  const breathe = sin(frameCount*0.035)*0.5+0.5;
+
+  // Breathing ring
+  noFill(); stroke(...INK, map(breathe,0,1,8,22)); strokeWeight(1.5);
+  circle(cx, cy, 200+breathe*16);
+
+  // Mic button
+  const r = 54, hov = dist(mouseX,mouseY,cx,cy) < r;
+  fill(...PANEL); stroke(...INK); strokeWeight(1);
+  circle(cx, cy, r*2);
+
+  // Mic icon
+  fill(hov ? ACCENT : INK_DIM); noStroke();
+  const mw=13,mh=20,mTop=cy-mh/2-4;
+  rectMode(CORNER);
+  rect(cx-mw/2, mTop+mw/2, mw, mh-mw/2, 2);
+  ellipse(cx, mTop+mw/2, mw, mw);
+  noFill(); stroke(hov ? ACCENT : INK_DIM); strokeWeight(2);
+  const arcY = cy+mh/2-2;
+  arc(cx, arcY-2, 22, 14, PI, TWO_PI);
+  line(cx, arcY+5, cx, arcY+11);
+  line(cx-7, arcY+11, cx+7, arcY+11);
+
+  fill(...INK_DIM); noStroke(); textSize(10); textStyle(NORMAL); textAlign(CENTER);
+  text('CLICK TO RECORD', cx, cy+r+20);
+  const upY = cy+r+38, hovUp = abs(mouseX-cx)<70&&abs(mouseY-upY)<10;
+  fill(hovUp?INK:INK_FAINT); textSize(9); text('or upload a file', cx, upY);
+  cursor(hov||hovUp ? HAND : ARROW);
+}
+
+// ── RECORDING ─────────────────────────────────────────────────────────────────
+
+function drawRecording() {
+  const cx=width/2, cy=height/2-30;
+  for(let i=0;i<3;i++){
+    const p=(frameCount*0.04+i*0.8)%TWO_PI;
+    noFill(); stroke(0,70,65,map(sin(p),-1,1,4,22-i*6)); strokeWeight(1.5);
+    circle(cx,cy,(90+i*28+sin(p)*8)*2);
+  }
+  const r=50, hov=dist(mouseX,mouseY,cx,cy)<r;
+  fill(...PANEL); stroke(...INK); strokeWeight(1); circle(cx,cy,r*2);
+  fill(0,75,65); noStroke(); rectMode(CENTER); rect(cx,cy,18,18,3); rectMode(CORNER);
+  const elapsed=((millis()-recStart)/1000).toFixed(1);
+  fill(0,75,frameCount%40<20?60:40); noStroke(); textSize(10); textAlign(CENTER);
+  text(`● REC  ${elapsed}s`, cx, cy+r+20);
+  if(analyserNode&&waveformData){
+    analyserNode.getByteTimeDomainData(waveformData);
+    const ww=min(480,width-80),wh=54,wx=(width-ww)/2,wy=cy+r+36;
+    fill(...PANEL); stroke(...INK); strokeWeight(1); rect(wx,wy,ww,wh,R);
+    stroke(...INK,20); line(wx+4,wy+wh/2,wx+ww-4,wy+wh/2);
+    stroke(DRUMS[0].hue,65,55); strokeWeight(1.5); noFill(); beginShape();
+    for(let i=0;i<waveformData.length;i++)
+      vertex(wx+map(i,0,waveformData.length-1,4,ww-4),wy+map(waveformData[i],0,255,wh-4,4));
+    endShape();
+  }
+  fill(...INK_FAINT); noStroke(); textSize(9); textAlign(CENTER);
+  text('CLICK TO STOP & ANALYSE', cx, height-FOOTER_H/2);
+  cursor(hov?HAND:ARROW);
+}
+
+// ── PROCESSING ────────────────────────────────────────────────────────────────
+
+function drawProcessing() {
+  const cx=width/2, cy=height/2-20, ticks=16;
+  for(let i=0;i<ticks;i++){
+    const a=(i/ticks)*TWO_PI+spinAngle;
+    const alpha=pow(((i/ticks+spinAngle/TWO_PI)%1),1.5)*70+5;
+    stroke(...ACCENT,alpha); strokeWeight(2);
+    line(cx+cos(a)*38,cy+sin(a)*38,cx+cos(a)*52,cy+sin(a)*52);
+  }
+  fill(...ACCENT); noStroke(); circle(cx,cy,8);
+  fill(...INK); textSize(11); textAlign(CENTER);
+  text(statusMsg||'ANALYSING…',cx,cy+72);
+  fill(...INK_DIM); textSize(9);
+  text('running CLAP embeddings — may take 15–40 s',cx,cy+88);
+}
+
+// ── READY ─────────────────────────────────────────────────────────────────────
+
+function drawReady() {
+  drawPads();
+  drawSequencer();
 }
 
 // ── Pads ──────────────────────────────────────────────────────────────────────
@@ -324,14 +319,14 @@ function drawPads() {
   const { padW, padH, gap, startX, padY } = getPadLayout();
 
   DRUMS.forEach((d, i) => {
-    const x   = startX + i*(padW+gap);
-    const has = drumCandidates[d.id].length > 0;
+    const x       = startX + i*(padW+gap);
+    const has     = drumCandidates[d.id].length > 0;
     const cands   = drumCandidates[d.id];
     const curCand = cands[drumIdx[d.id]];
 
     const ago      = millis()-padFlash[d.id];
-    const flashAmt = max(0,1-ago/110);
-    const active   = flashAmt>0||padHeld[d.id];
+    const flashAmt = max(0, 1-ago/110);
+    const active   = flashAmt>0 || padHeld[d.id];
 
     const tb  = trimBarRegion(x,padY,padW);
     const vol = volStripRegion(x,padY,padW);
@@ -342,79 +337,83 @@ function drawPads() {
     const overSwap = mouseX>swp.x&&mouseX<swp.x+swp.w&&mouseY>swp.y&&mouseY<swp.y+swp.h;
     const overPad  = mouseX>x&&mouseX<x+padW&&mouseY>padY&&mouseY<padY+padH&&!overVol&&!overSwap;
 
-    // Trim bar
-    fill(0,0,10); noStroke(); rect(tb.x,tb.y,tb.w,tb.h,2);
+    // ── Trim bar ─────────────────────────────────────────────────────────────
+    fill(...PANEL); stroke(...INK); strokeWeight(1); rect(tb.x,tb.y,tb.w,tb.h,3);
     if(has&&curCand){
       const buf=curCand.buffer, chan=buf.getChannelData(0);
       const step=max(1,Math.floor(chan.length/tb.w));
       for(let px=0;px<tb.w;px++){
         const frac=px/tb.w;
         const inTrim=frac>=drumTrimStart[d.id]&&frac<=drumTrimEnd[d.id];
-        let peak=0;
-        const si=Math.floor(frac*chan.length);
+        let peak=0; const si=Math.floor(frac*chan.length);
         for(let s=si;s<min(si+step,chan.length);s++) peak=max(peak,abs(chan[s]));
-        const bh=peak*tb.h*0.88;
-        stroke(d.hue,inTrim?55:18,inTrim?80:42,inTrim?85:28); strokeWeight(1);
-        line(tb.x+px,tb.y+tb.h/2-bh/2,tb.x+px,tb.y+tb.h/2+bh/2);
+        const bh=peak*(tb.h-4)*0.9;
+        stroke(d.hue, inTrim?DRUM_S:20, inTrim?DRUM_B:78); strokeWeight(1);
+        line(tb.x+px, tb.y+tb.h/2-bh/2, tb.x+px, tb.y+tb.h/2+bh/2);
       }
-      noStroke(); fill(0,0,3,72);
-      rect(tb.x,tb.y,drumTrimStart[d.id]*tb.w,tb.h,2,0,0,2);
-      rect(tb.x+drumTrimEnd[d.id]*tb.w,tb.y,(1-drumTrimEnd[d.id])*tb.w,tb.h,0,2,2,0);
+      // dim overlays outside trim
+      noStroke(); fill(...BG, 60);
+      rect(tb.x+1, tb.y+1, drumTrimStart[d.id]*(tb.w-2), tb.h-2, 2,0,0,2);
+      const endFrac=drumTrimEnd[d.id];
+      rect(tb.x+1+endFrac*(tb.w-2), tb.y+1, (1-endFrac)*(tb.w-2), tb.h-2, 0,2,2,0);
+      // handles
       const {startPx,endPx}=trimHandleX(x,padW,d.id);
       const nearS=abs(mouseX-startPx)<8&&overTb, nearE=abs(mouseX-endPx)<8&&overTb;
-      fill(d.hue,nearS?70:44,nearS?95:74); noStroke(); rect(startPx-1,tb.y-3,3,tb.h+6,1);
-      fill(d.hue,nearE?70:44,nearE?95:74);              rect(endPx-1,  tb.y-3,3,tb.h+6,1);
-      fill(...DIM,50); noStroke(); textSize(7); textAlign(LEFT);
-      text('TRIM',tb.x,tb.y-4);
+      fill(d.hue,nearS?80:DRUM_S,nearS?70:DRUM_B); noStroke();
+      rect(startPx-1.5, tb.y, 3, tb.h, 1);
+      fill(d.hue,nearE?80:DRUM_S,nearE?70:DRUM_B);
+      rect(endPx-1.5,   tb.y, 3, tb.h, 1);
+
     } else {
-      fill(...DIM,20); noStroke(); textSize(7); textAlign(CENTER);
-      text('no audio',tb.x+tb.w/2,tb.y+tb.h/2+3);
+      fill(...INK_FAINT); noStroke(); textSize(7); textAlign(CENTER);
+      text('no audio', tb.x+tb.w/2, tb.y+tb.h/2+3);
     }
 
-    // Pad body
-    stroke(d.hue,active?65:55,active?90:70,has?(active?90:overPad?60:35):15);
-    strokeWeight(active?2:1); fill(d.hue,active?40:20,active?16:overPad?11:8);
-    rectMode(CORNER); rect(x,padY,padW,padH,3);
-    if(active){noStroke();fill(d.hue,60,90,flashAmt*12);rect(x,padY,padW,padH,3);}
+    // ── Pad body ─────────────────────────────────────────────────────────────
+    if(active){
+      fill(d.hue, DRUM_S, DRUM_B+8);
+    } else if(overPad && has){
+      fill(d.hue, DRUM_S_LITE+10, DRUM_B_LITE-4);
+    } else {
+      fill(...PANEL);
+    }
+    stroke(...INK); strokeWeight(active?2:1);
+    rect(x, padY, padW, padH, R);
 
-    noStroke(); fill(d.hue,has?(active?20:30):10,active?96:(has?72:35));
-    textSize(46); textStyle(BOLD); textAlign(CENTER,CENTER);
-    text(d.kbd,x+padW/2,padY+padH/2-22);
+    // Colored top accent bar
+    fill(d.hue, DRUM_S, DRUM_B, has?90:30); noStroke();
+    rect(x+1, padY+1, padW-2, 5, R, R, 0, 0);
 
+    // Key letter
+    fill(active ? [0,0,98] : has ? [d.hue, DRUM_S, DRUM_B] : INK_FAINT);
+    noStroke(); textSize(42); textStyle(BOLD); textAlign(CENTER,CENTER);
+    text(d.kbd, x+padW/2, padY+padH/2-20);
+
+    // Label
     textStyle(NORMAL);
-    fill(d.hue,has?30:10,active?90:(has?65:28));
-    textSize(10); textAlign(CENTER);
-    text(d.label,x+padW/2,padY+padH-62);
-    fill(...DIM,has?60:25); textSize(8);
-    text(d.sub,x+padW/2,padY+padH-51);
+    fill(active?[0,0,95]:INK); textSize(9); textAlign(CENTER);
+    text(d.label, x+padW/2, padY+padH-57);
 
-    if(has&&curCand){
-      const norm=constrain(map(curCand.score,0.08,0.42,0,1),0,1);
-      fill(d.hue,20,40); noStroke(); rect(x+10,padY+padH-41,padW-20,3,2);
-      fill(d.hue,55,78,80); rect(x+10,padY+padH-41,(padW-20)*norm,3,2);
-      fill(d.hue,20,50); textSize(7); textAlign(RIGHT);
-      text(curCand.score.toFixed(3),x+padW-8,padY+padH-30);
-    } else {
-      fill(...DIM,30); textSize(8); textAlign(CENTER);
-      text('NOT FOUND',x+padW/2,padY+padH-38);
-    }
+
+
 
     // Volume strip
-    fill(0,0,12); noStroke(); rect(vol.x,vol.y,vol.w,vol.h,3);
-    fill(d.hue,overVol?55:40,overVol?80:65,has?85:40);
-    rect(vol.x,vol.y,vol.w*drumVolumes[d.id],vol.h,3);
-    fill(...DIM,overVol?80:40); textSize(7); textAlign(LEFT);
-    text('VOL',vol.x,vol.y-3);
+    fill(...BG); stroke(...INK); strokeWeight(1); rect(vol.x,vol.y,vol.w,vol.h,4);
+    fill(d.hue,DRUM_S,DRUM_B,has?85:35); noStroke();
+    rect(vol.x, vol.y, vol.w*drumVolumes[d.id], vol.h, 4);
+
 
     // Swap button
     const hasSwap=cands.length>1;
     if(hasSwap){
-      fill(d.hue,overSwap?50:30,overSwap?80:55,overSwap?90:60); noStroke();
-      circle(swp.x+swp.w/2,swp.y+swp.h/2,swp.w);
-      fill(d.hue,10,overSwap?96:80); textSize(8); textAlign(CENTER,CENTER);
-      text('↻',swp.x+swp.w/2,swp.y+swp.h/2+1);
-      fill(...DIM,50); textSize(6); textAlign(LEFT);
-      text(`${drumIdx[d.id]+1}/${cands.length}`,swp.x-12,swp.y+swp.h/2+2);
+      const hov2=mouseX>swp.x&&mouseX<swp.x+swp.w&&mouseY>swp.y&&mouseY<swp.y+swp.h;
+      fill(hov2?ACCENT:PANEL); stroke(...INK); strokeWeight(1);
+      circle(swp.x+swp.w/2, swp.y+swp.h/2, swp.w);
+      fill(...INK); noStroke(); textSize(8); textAlign(CENTER,CENTER);
+      text('↻', swp.x+swp.w/2, swp.y+swp.h/2+1);
+      fill(...INK); textSize(8); textStyle(BOLD); textAlign(RIGHT);
+      text(`${drumIdx[d.id]+1}/${cands.length}`, swp.x-4, swp.y+swp.h/2+2);
+      textStyle(NORMAL);
     }
 
     const {startPx,endPx}=trimHandleX(x,padW,d.id);
@@ -422,184 +421,190 @@ function drawPads() {
     cursor(nearH||overVol||(overSwap&&hasSwap)||(overPad&&has)?HAND:ARROW);
   });
 
-  noStroke(); fill(...DIM,40); textSize(8); textStyle(NORMAL); textAlign(CENTER);
-  text('K · S · H · C   ·   CLICK PADS   ·   SPACE = PLAY/STOP   ·   R = RE-RECORD   ·   U = UPLOAD', width/2, height-FOOTER_H/2+2);
+
 }
 
 // ── Sequencer ─────────────────────────────────────────────────────────────────
 
 function drawSequencer() {
-  const { seqTop, margin, labelW, seqW, ctrlY, gridTop } = getSeqLayout();
-
-  stroke(...DIM,30); strokeWeight(0.5);
-  line(margin, seqTop-8, width-margin, seqTop-8);
-
+  const { seqTop, seqW, rowH, ctrlY, gridTop, gridLeft } = getSeqLayout();
   const ctrlMid = ctrlY + SEQ_CTRL_H/2;
 
-  // ── Play / Stop ────────────────────────────────────────────────────────────
-  const playX = margin + labelW;
-  const playR = 13;
-  const playHov = dist(mouseX,mouseY,playX,ctrlMid) < playR;
-  fill(seqPlaying ? 120 : 140, seqPlaying?70:55, seqPlaying?85:70, playHov?95:80);
-  noStroke(); circle(playX,ctrlMid,playR*2);
-  fill(0,0,seqPlaying?10:95); noStroke();
+  // Controls panel
+  fill(...PANEL); stroke(...INK); strokeWeight(1);
+  rect(SEQ_MARGIN, ctrlY, width-SEQ_MARGIN*2, SEQ_CTRL_H, R);
+
+  const playX = SEQ_MARGIN + SEQ_LABEL_W;
+
+  // Play/stop
+  const playR=12, playHov=dist(mouseX,mouseY,playX,ctrlMid)<playR;
+  fill(seqPlaying?[120,55,72]:playHov?ACCENT:PANEL);
+  stroke(...INK); strokeWeight(1); circle(playX,ctrlMid,playR*2);
+  fill(seqPlaying?[0,0,98]:INK); noStroke();
   if(seqPlaying){
-    rectMode(CENTER); rect(playX-3,ctrlMid,3,10,1); rect(playX+3,ctrlMid,3,10,1); rectMode(CORNER);
+    rectMode(CENTER); rect(playX-3,ctrlMid,3,9,1); rect(playX+3,ctrlMid,3,9,1); rectMode(CORNER);
   } else {
-    triangle(playX-4,ctrlMid-7,playX-4,ctrlMid+7,playX+7,ctrlMid);
+    triangle(playX-4,ctrlMid-6,playX-4,ctrlMid+6,playX+7,ctrlMid);
   }
 
-  // ── Record button ──────────────────────────────────────────────────────────
-  const recBtnX = playX + playR*2 + 10 + 10;
-  const recBtnR = 10;
-  const recHov  = dist(mouseX,mouseY,recBtnX,ctrlMid) < recBtnR;
-  // Pulsing glow when armed
-  const recPulse = seqRecording ? (sin(frameCount*0.15)*0.5+0.5) : 0;
+  // Record button
+  const recBtnX=playX+playR*2+16, recBtnR=9;
+  const recHov=dist(mouseX,mouseY,recBtnX,ctrlMid)<recBtnR;
+  const recPulse=seqRecording?(sin(frameCount*0.15)*0.5+0.5):0;
   if(seqRecording){
-    noFill(); stroke(0, 80, 90, recPulse*35);
-    strokeWeight(3); circle(recBtnX,ctrlMid,recBtnR*2+8);
+    noFill(); stroke(0,70,60,recPulse*40); strokeWeight(3);
+    circle(recBtnX,ctrlMid,recBtnR*2+10);
   }
-  fill(0, seqRecording?80:55, seqRecording?90:65, recHov?100:85);
-  noStroke(); circle(recBtnX,ctrlMid,recBtnR*2);
-  // Dot
-  fill(0,0, seqRecording?98:80); noStroke();
-  circle(recBtnX,ctrlMid,5);
+  fill(seqRecording?[0,70,68]:recHov?[0,30,92]:PANEL);
+  stroke(...INK); strokeWeight(1); circle(recBtnX,ctrlMid,recBtnR*2);
+  fill(seqRecording?[0,0,98]:INK); noStroke(); circle(recBtnX,ctrlMid,5);
 
-  // ── BPM slider ────────────────────────────────────────────────────────────
-  const bpmLabelX  = recBtnX + recBtnR + 14;
-  const bpmSliderX = bpmLabelX + 28;
-  const bpmSliderW = 100;
-
-  fill(...DIM,60); noStroke(); textSize(8); textAlign(LEFT,CENTER);
+  // BPM
+  const bpmLabelX=recBtnX+recBtnR+12, bpmSliderX=bpmLabelX+28, bpmSliderW=100;
+  fill(...INK_DIM); noStroke(); textSize(8); textAlign(LEFT,CENTER);
   text('BPM', bpmLabelX, ctrlMid);
-
-  fill(0,0,16); noStroke(); rect(bpmSliderX, ctrlMid-4, bpmSliderW, 8, 4);
-  const bpmNorm = (seqBPM-40)/(240-40);
-  fill(...AMBER,75); rect(bpmSliderX, ctrlMid-4, bpmSliderW*bpmNorm, 8, 4);
-  const thumbX   = bpmSliderX + bpmSliderW*bpmNorm;
-  const thumbHov = abs(mouseX-thumbX)<8 && abs(mouseY-ctrlMid)<10;
-  fill(...AMBER,thumbHov?100:80); noStroke(); circle(thumbX, ctrlMid, 12);
-  fill(...AMBER,85); textSize(9); textAlign(LEFT,CENTER);
+  fill(...BG); stroke(...INK); strokeWeight(1); rect(bpmSliderX,ctrlMid-4,bpmSliderW,8,4);
+  const bpmNorm=(seqBPM-40)/200;
+  fill(...ACCENT,80); noStroke(); rect(bpmSliderX,ctrlMid-4,bpmSliderW*bpmNorm,8,4);
+  const thumbX=bpmSliderX+bpmSliderW*bpmNorm;
+  const tHov=abs(mouseX-thumbX)<8&&abs(mouseY-ctrlMid)<10;
+  fill(tHov?ACCENT:PANEL); stroke(...INK); strokeWeight(1); circle(thumbX,ctrlMid,11);
+  fill(...INK); noStroke(); textSize(9); textAlign(LEFT,CENTER);
   text(Math.round(seqBPM), bpmSliderX+bpmSliderW+8, ctrlMid);
 
-  // ── Tap tempo ─────────────────────────────────────────────────────────────
-  const tapX = bpmSliderX + bpmSliderW + 36;
-  const tapW=38, tapH=20;
-  const tapHov = mouseX>tapX&&mouseX<tapX+tapW&&mouseY>ctrlMid-tapH/2&&mouseY<ctrlMid+tapH/2;
-  fill(40,tapHov?55:35,tapHov?70:50); noStroke(); rect(tapX,ctrlMid-tapH/2,tapW,tapH,3);
-  fill(...AMBER,85); textSize(8); textAlign(CENTER,CENTER);
-  text('TAP',tapX+tapW/2,ctrlMid);
+  // Tap
+  const tapX=bpmSliderX+bpmSliderW+36, tapW=34, tapH=20;
+  const tapHov=mouseX>tapX&&mouseX<tapX+tapW&&mouseY>ctrlMid-tapH/2&&mouseY<ctrlMid+tapH/2;
+  fill(tapHov?ACCENT:PANEL); stroke(...INK); strokeWeight(1); rect(tapX,ctrlMid-tapH/2,tapW,tapH,R);
+  fill(...INK); noStroke(); textSize(8); textAlign(CENTER,CENTER);
+  text('TAP', tapX+tapW/2, ctrlMid);
 
-  // ── Steps label (the HTML input is positioned here by positionStepsInput) ──
-  const stepLabelX = tapX + tapW + 20;
-  fill(...DIM,55); noStroke(); textSize(8); textAlign(LEFT,CENTER);
-  text('STEPS', stepLabelX, ctrlMid);
-  // Show current value as faint underlay (input floats on top)
-  fill(...AMBER,25); textSize(11); textAlign(LEFT,CENTER);
-  text(seqSteps, stepLabelX+38, ctrlMid);
+  // Global clear
+  const clrX=tapX+tapW+14, clrW=42, clrH=20;
+  const clrHov=mouseX>clrX&&mouseX<clrX+clrW&&mouseY>ctrlMid-clrH/2&&mouseY<ctrlMid+clrH/2;
+  fill(clrHov?[0,60,82]:PANEL); stroke(...INK); strokeWeight(1); rect(clrX,ctrlMid-clrH/2,clrW,clrH,R);
+  fill(clrHov?[0,0,98]:INK); noStroke(); textSize(8); textAlign(CENTER,CENTER);
+  text('CLR ALL', clrX+clrW/2, ctrlMid);
 
-  // ── Grouping buttons ─────────────────────────────────────────────────────
-  const grpOpts   = [2, 3, 4, 5, 7];
-  const grpBtnW   = 22, grpBtnH = 16;
-  const grpStartX = stepLabelX + 82;
-  fill(...DIM,45); noStroke(); textSize(8); textAlign(LEFT,CENTER);
-  text('DIV', grpStartX, ctrlMid);
-  grpOpts.forEach((n, gi) => {
-    const bx  = grpStartX + 26 + gi*(grpBtnW+3);
-    const bHov = mouseX>bx&&mouseX<bx+grpBtnW&&mouseY>ctrlMid-grpBtnH/2&&mouseY<ctrlMid+grpBtnH/2;
-    const sel  = n===seqGrouping;
-    fill(sel?AMBER[0]:40, sel?AMBER[1]:30, sel?AMBER[2]:50, bHov?95:80);
-    noStroke(); rect(bx, ctrlMid-grpBtnH/2, grpBtnW, grpBtnH, 3);
-    fill(sel?0:360, 0, sel?8:70); textSize(8); textAlign(CENTER,CENTER);
-    text(n, bx+grpBtnW/2, ctrlMid);
-  });
+  // ── Stacked grids ─────────────────────────────────────────────────────────
+  const frac    = loopFraction();
+  const scanX   = gridLeft + frac * seqW;
+  const totalH  = GRIDS.length * (DRUMS.length*rowH + GRID_GAP) - GRID_GAP;
 
-  // ── Grid ──────────────────────────────────────────────────────────────────
-  const cellW = seqW / seqSteps;
-  const cellH = SEQ_ROW_H;
+  GRIDS.forEach((g, gi) => {
+    const gTop  = gridY(gi, gridTop, rowH);
+    const gridH = DRUMS.length * rowH;
+    const cellW = seqW / g.steps;
 
-  // Group shading every seqGrouping steps
-  for(let s=0; s<seqSteps; s+=seqGrouping){
-    const gx      = margin + labelW + s*cellW;
-    const groupW  = min(seqGrouping, seqSteps-s) * cellW;
-    const groupNum = Math.floor(s / seqGrouping);
-    fill(groupNum%2===0 ? [0,0,11] : [0,0,8]); noStroke();
-    rect(gx, gridTop, groupW, cellH*DRUMS.length, 2);
-  }
+    // Grid panel
+    fill(...PANEL); stroke(...INK); strokeWeight(1);
+    rect(SEQ_MARGIN, gTop, width-SEQ_MARGIN*2, gridH, R);
 
-  DRUMS.forEach((d,ri) => {
-    const ry = gridTop + ri*cellH;
+    // Step count label — large, outside the panel to the left
+    fill(...INK); noStroke(); textSize(16); textStyle(BOLD); textAlign(RIGHT, CENTER);
+    text(g.steps, SEQ_MARGIN-4, gTop+gridH/2);
+    textStyle(NORMAL);
 
-    // Row label
-    noStroke(); fill(d.hue, 35, 65); textSize(9); textAlign(RIGHT,CENTER);
-    text(d.label, margin+labelW-8, ry+cellH/2);
+    // Clear button
+    const cb = clearBtnRegion(gi, gridTop, rowH);
+    const cbHov = mouseX>cb.x&&mouseX<cb.x+cb.w&&mouseY>cb.y&&mouseY<cb.y+cb.h;
+    fill(cbHov?[0,55,82]:PANEL); stroke(...INK); strokeWeight(1); rect(cb.x,cb.y,cb.w,cb.h,3);
+    fill(cbHov?[0,0,98]:INK_DIM); noStroke(); textSize(10); textAlign(CENTER,CENTER);
+    text('✕', cb.x+cb.w/2, cb.y+cb.h/2+1);
 
-    for(let s=0; s<seqSteps; s++){
-      const cx2 = margin + labelW + s*cellW;
-      const on   = seqGrid[d.id][s];
-      const isHead = seqPlaying && s===seqCurrentStep;
-      const cellHov = mouseX>cx2+1&&mouseX<cx2+cellW-1&&mouseY>ry+1&&mouseY<ry+cellH-1;
+    // Clip grid into panel bounds
+    const innerX = gridLeft, innerW = seqW;
 
-      if(isHead && on){
-        fill(d.hue, 70, 98); noStroke();
-      } else if(isHead){
-        fill(d.hue, 25, 45, 90); noStroke();
-      } else if(on){
-        fill(d.hue, 65, 85, cellHov?100:88); noStroke();
-      } else {
-        fill(d.hue, cellHov?25:15, cellHov?30:18, cellHov?80:60); noStroke();
+    // Group shading: alternate every 4 steps for visual reference
+    for(let s=0; s<g.steps; s++){
+      const cx2 = innerX + s*cellW;
+      const groupOf4 = Math.floor(s/4);
+      fill(groupOf4%2===0 ? [0,0,97] : [0,0,94]); noStroke();
+      // Clip to panel rounded corners on edges
+      rect(max(cx2, innerX), gTop+1, min(cellW, innerX+innerW-max(cx2,innerX))-1, gridH-2);
+    }
+
+    DRUMS.forEach((d, ri) => {
+      const ry = gTop + ri*rowH;
+
+      // Row divider (except last)
+      if(ri < DRUMS.length-1){
+        stroke(...INK, 18); strokeWeight(0.5);
+        line(gridLeft, ry+rowH, gridLeft+seqW, ry+rowH);
       }
-      rect(cx2+1, ry+1, cellW-2, cellH-2, 2);
 
-      if(!on&&!isHead){
-        const isDivision = s%seqGrouping===0;
-        fill(d.hue,20,isDivision?35:22,80); noStroke();
-        circle(cx2+cellW/2, ry+cellH/2, isDivision?4:2.5);
+      // Row label on every grid
+      fill(d.hue, DRUM_S, DRUM_B); noStroke(); textSize(8); textStyle(BOLD); textAlign(RIGHT, CENTER);
+      text(d.label, gridLeft-28, ry+rowH/2);
+      textStyle(NORMAL);
+
+      for(let s=0; s<g.steps; s++){
+        const cx2     = innerX + s*cellW;
+        const on      = seqGrid[gi][d.id][s];
+        const cFracS  = s / g.steps, cFracE = (s+1) / g.steps;
+        const isHead  = seqPlaying && frac>=cFracS && frac<cFracE;
+        const cHov    = mouseX>cx2+1&&mouseX<cx2+cellW-1&&mouseY>ry+1&&mouseY<ry+rowH-1;
+
+        const pad = 1.5;
+        if(isHead&&on)     { fill(d.hue, DRUM_S+8, DRUM_B+10); noStroke(); }
+        else if(isHead)    { fill(d.hue, DRUM_S_LITE, DRUM_B_LITE-8); noStroke(); }
+        else if(on)        { fill(d.hue, DRUM_S, DRUM_B, cHov?100:90); noStroke(); }
+        else               { fill(d.hue, cHov?28:DRUM_S_LITE-10, cHov?85:DRUM_B_LITE+2, cHov?60:0); noStroke(); }
+
+        if(on||isHead)     rect(cx2+pad, ry+pad, cellW-pad*2, rowH-pad*2, 2);
+
+        // Beat dot on empty cells
+        if(!on&&!isHead){
+          const isBeat=s%4===0;
+          fill(d.hue, 30, isBeat?65:80, 80); noStroke();
+          circle(cx2+cellW/2, ry+rowH/2, isBeat?3.5:2);
+        }
       }
+    });
+
+    // Inner column dividers (thin vertical lines at cell boundaries)
+    for(let s=1; s<g.steps; s++){
+      const cx2 = innerX + s*cellW;
+      stroke(...INK, s%4===0 ? 20 : 8); strokeWeight(0.5);
+      line(cx2, gTop+1, cx2, gTop+gridH-1);
     }
   });
 
-  // Playhead line
+  // ── Single scanline through all grids ─────────────────────────────────────
   if(seqPlaying){
-    const phX = margin + labelW + (seqCurrentStep+0.5)*cellW;
-    stroke(...AMBER, 35); strokeWeight(1);
-    line(phX, gridTop, phX, gridTop+DRUMS.length*cellH);
+    // Glow
+    stroke(...ACCENT, 25); strokeWeight(6);
+    line(scanX, gridTop, scanX, gridTop+totalH);
+    // Line
+    stroke(...INK, 70); strokeWeight(1);
+    line(scanX, gridTop, scanX, gridTop+totalH);
   }
 
-  // Record-mode overlay: red tint on grid when recording
+  // REC label
   if(seqRecording){
-    noStroke(); fill(0, 60, 40, 8);
-    rect(margin+labelW, gridTop, seqW, DRUMS.length*cellH, 2);
-    // "REC" label
-    fill(0,80,90, 70+sin(frameCount*0.15)*20);
-    textSize(8); textAlign(RIGHT, TOP); noStroke();
-    text('● REC', margin+labelW+seqW-4, gridTop+4);
+    fill(0,65,58, 70+sin(frameCount*0.15)*20);
+    textSize(8); textAlign(RIGHT,TOP); noStroke();
+    text('● REC', width-SEQ_MARGIN-6, gridTop+4);
   }
-
-  // Border
-  stroke(...DIM,20); strokeWeight(0.5); noFill();
-  rect(margin+labelW, gridTop, seqW, DRUMS.length*cellH, 2);
 }
 
 // ── ERROR ─────────────────────────────────────────────────────────────────────
 
 function drawError() {
-  stepsInput.hide();
   const cx=width/2,cy=height/2;
-  fill(0,75,85); textSize(11); textAlign(CENTER); text('ERROR',cx,cy-18);
-  fill(0,50,70); textSize(9); text(errorMsg,cx,cy);
-  fill(...DIM,50); textSize(9); text('CLICK TO TRY AGAIN',cx,cy+26);
+  fill(0,65,62); textSize(11); textAlign(CENTER); text('ERROR',cx,cy-18);
+  fill(...INK_DIM); textSize(9); text(errorMsg,cx,cy);
+  fill(...INK_FAINT); textSize(9); text('CLICK TO TRY AGAIN',cx,cy+26);
   cursor(HAND);
 }
 
-// ── Lookahead scheduler ───────────────────────────────────────────────────────
+// ── Scheduler ─────────────────────────────────────────────────────────────────
 
 function startSequencer() {
   if(audioCtx.state==='suspended') audioCtx.resume();
-  _schedStep    = 0;
-  _nextNoteTime = audioCtx.currentTime + 0.05;
-  _loopStartTime = _nextNoteTime;   // time when step 0 fires
-  seqPlaying    = true;
+  GRIDS.forEach((_,gi)=>{ _nextSteps[gi]=0; });
+  _loopStartTime = audioCtx.currentTime + 0.05;
+  seqPlaying     = true;
   scheduleLoop();
 }
 
@@ -611,79 +616,53 @@ function stopSequencer() {
 
 function scheduleLoop() {
   if(!seqPlaying) return;
-  while(_nextNoteTime < audioCtx.currentTime + SCHEDULE_AHEAD){
-    fireStep(_schedStep, _nextNoteTime);
-    seqCurrentStep = _schedStep;
-    const secPerStep = (60.0/seqBPM) / 4;
-    _nextNoteTime += secPerStep;
-    _schedStep = (_schedStep+1) % seqSteps;
-    // Keep _loopStartTime in sync — it trails behind by one full loop
-    if(_schedStep === 0) _loopStartTime = _nextNoteTime;
+  const now=audioCtx.currentTime, loopDur=loopDuration();
+  if(now >= _loopStartTime + loopDur){
+    _loopStartTime += loopDur;
+    GRIDS.forEach((_,gi)=>{ _nextSteps[gi]=0; });
+    if(seqRecording) scheduleMetronomeClick(_loopStartTime, true);
   }
-  scheduleTimer = setTimeout(scheduleLoop, LOOKAHEAD_MS);
-}
-
-function fireStep(step, time) {
-  DRUMS.forEach(d => {
-    if(seqGrid[d.id][step]) triggerDrumAtTime(d.id, time);
+  GRIDS.forEach((g,gi)=>{
+    const sDur=loopDur/g.steps;
+    while(_nextSteps[gi]<g.steps){
+      const t=_loopStartTime+_nextSteps[gi]*sDur;
+      if(t>now+SCHEDULE_AHEAD) break;
+      DRUMS.forEach(d=>{ if(seqGrid[gi][d.id][_nextSteps[gi]]) triggerDrumAtTime(d.id,t); });
+      if(gi===0&&seqRecording&&_nextSteps[gi]%4===0&&_nextSteps[gi]>0)
+        scheduleMetronomeClick(t, false);
+      _nextSteps[gi]++;
+    }
   });
-  // Metronome: click on every beat division when recording is armed
-  if(seqRecording && step % seqGrouping === 0) {
-    scheduleMetronomeClick(time, step === 0);
-  }
-}
-
-function scheduleMetronomeClick(when, isDownbeat) {
-  // Synthesize a short click using an oscillator + exponential decay
-  // Downbeat: higher pitch; subdivision: lower pitch
-  const osc  = audioCtx.createOscillator();
-  const env  = audioCtx.createGain();
-  osc.connect(env);
-  env.connect(audioCtx.destination);
-
-  osc.frequency.value  = isDownbeat ? 1200 : 800;
-  osc.type             = 'sine';
-  env.gain.setValueAtTime(0.35, when);
-  env.gain.exponentialRampToValueAtTime(0.001, when + 0.04);
-
-  osc.start(when);
-  osc.stop(when + 0.05);
+  scheduleTimer=setTimeout(scheduleLoop, LOOKAHEAD_MS);
 }
 
 function triggerDrumAtTime(id, when) {
-  const cands = drumCandidates[id];
-  if(!cands||!cands.length) return;
-  const cand = cands[drumIdx[id]];
-  if(!cand) return;
-  const src = audioCtx.createBufferSource();
-  src.buffer = cand.buffer;
-  src.connect(gainNodes[id]);
-  const dur    = cand.buffer.duration;
-  const offset = drumTrimStart[id] * dur;
-  const length = (drumTrimEnd[id]-drumTrimStart[id]) * dur;
-  src.start(when, offset, length);
+  const cands=drumCandidates[id]; if(!cands||!cands.length) return;
+  const cand=cands[drumIdx[id]]; if(!cand) return;
+  const src=audioCtx.createBufferSource();
+  src.buffer=cand.buffer; src.connect(gainNodes[id]);
+  const dur=cand.buffer.duration;
+  src.start(when, drumTrimStart[id]*dur, (drumTrimEnd[id]-drumTrimStart[id])*dur);
 }
 
-// ── Record quantization ───────────────────────────────────────────────────────
-//
-// When recording, we know the audio clock position within the current loop:
-//   posInLoop = (audioCtx.currentTime - _loopStartTime) % loopLength
-// Divide by stepDuration and round to get the nearest step.
-// Using audioCtx.currentTime (not millis()) keeps it tight.
+function scheduleMetronomeClick(when, isDownbeat) {
+  const osc=audioCtx.createOscillator(), env=audioCtx.createGain();
+  osc.connect(env); env.connect(audioCtx.destination);
+  osc.frequency.value=isDownbeat?1200:800; osc.type='sine';
+  env.gain.setValueAtTime(0.3,when);
+  env.gain.exponentialRampToValueAtTime(0.001,when+0.04);
+  osc.start(when); osc.stop(when+0.05);
+}
 
-function quantizeToStep(id) {
-  const secPerStep  = (60.0/seqBPM) / 4;
-  const loopLength  = seqSteps * secPerStep;
-  const now         = audioCtx.currentTime;
-
-  // How far into the current loop are we?
-  let posInLoop = (now - _loopStartTime) % loopLength;
-  if(posInLoop < 0) posInLoop += loopLength;
-
-  const step = Math.round(posInLoop / secPerStep) % seqSteps;
-
-  // Toggle the step (overdub mode — don't wipe existing pattern)
-  seqGrid[id][step] = !seqGrid[id][step];
+function quantizeToAllGrids(id) {
+  const now=audioCtx.currentTime, loopDur=loopDuration();
+  let pos=(now-_loopStartTime)%loopDur;
+  if(pos<0) pos+=loopDur;
+  const frac=pos/loopDur;
+  // Only quantize into grid 0 (16-step grid)
+  const g0 = GRIDS[0];
+  const step0 = Math.round(frac*g0.steps) % g0.steps;
+  seqGrid[0][id][step0] = !seqGrid[0][id][step0];
 }
 
 // ── Mouse ─────────────────────────────────────────────────────────────────────
@@ -692,7 +671,7 @@ function mousePressed() {
   if(audioCtx.state==='suspended') audioCtx.resume();
 
   if(phase==='idle'){
-    const cx=width/2,cy=height/2-20,r=54;
+    const cx=width/2,cy=height/2-10,r=54;
     if(dist(mouseX,mouseY,cx,cy)<r){startRecording();return;}
     const upY=cy+r+38;
     if(abs(mouseX-cx)<70&&abs(mouseY-upY)<10){uploadEl.elt.click();return;}
@@ -704,76 +683,70 @@ function mousePressed() {
   if(phase==='error'){phase='idle';return;}
 
   if(phase==='ready'){
-    const { seqTop, margin, labelW, seqW, ctrlY, gridTop } = getSeqLayout();
-    const ctrlMid = ctrlY + SEQ_CTRL_H/2;
-    const playX   = margin + labelW;
-    const recBtnX = playX + 13*2 + 10 + 10;
+    const { seqW, rowH, ctrlY, gridTop, gridLeft } = getSeqLayout();
+    const ctrlMid=ctrlY+SEQ_CTRL_H/2;
+    const playX=SEQ_MARGIN+SEQ_LABEL_W;
+    const recBtnX=playX+12*2+16;
 
     // Play/stop
-    if(dist(mouseX,mouseY,playX,ctrlMid)<13){
-      seqPlaying ? stopSequencer() : startSequencer(); return;
+    if(dist(mouseX,mouseY,playX,ctrlMid)<12){
+      seqPlaying?stopSequencer():startSequencer(); return;
     }
-
-    // Record button
-    if(dist(mouseX,mouseY,recBtnX,ctrlMid)<10){
-      if(!seqPlaying) startSequencer();   // auto-start playback when arming rec
-      seqRecording = !seqRecording;
-      return;
+    // Record
+    if(dist(mouseX,mouseY,recBtnX,ctrlMid)<9){
+      if(!seqPlaying) startSequencer();
+      seqRecording=!seqRecording; return;
     }
-
-    // Tap tempo
-    const bpmLabelX  = recBtnX + 10 + 14;
-    const bpmSliderX = bpmLabelX + 28;
-    const tapX       = bpmSliderX + 100 + 36;
-    const tapW=38, tapH=20;
+    // BPM thumb
+    const bpmLabelX=recBtnX+9+12, bpmSliderX=bpmLabelX+28;
+    const bpmNorm=(seqBPM-40)/200, thumbX=bpmSliderX+100*bpmNorm;
+    if(abs(mouseX-thumbX)<10&&abs(mouseY-ctrlMid)<10){
+      drag={type:'bpm',sliderX:bpmSliderX,sliderW:100}; return;
+    }
+    // Tap
+    const tapX=bpmSliderX+100+36, tapW=34, tapH=20;
     if(mouseX>tapX&&mouseX<tapX+tapW&&mouseY>ctrlMid-tapH/2&&mouseY<ctrlMid+tapH/2){
       handleTap(); return;
     }
 
-    // BPM thumb drag
-    const bpmNorm = (seqBPM-40)/(240-40);
-    const thumbX  = bpmSliderX + 100*bpmNorm;
-    if(abs(mouseX-thumbX)<10&&abs(mouseY-ctrlMid)<10){
-      drag={type:'bpm',sliderX:bpmSliderX,sliderW:100}; return;
+    // Global clear
+    {
+      const bpmLabelX2=recBtnX+9+12, bpmSliderX2=bpmLabelX2+28;
+      const tapX2=bpmSliderX2+100+36, tapW2=34;
+      const clrX=tapX2+tapW2+14, clrW=42, clrH=20;
+      if(mouseX>clrX&&mouseX<clrX+clrW&&mouseY>ctrlMid-clrH/2&&mouseY<ctrlMid+clrH/2){
+        GRIDS.forEach((_,gi)=>{ DRUMS.forEach(d=>{ seqGrid[gi][d.id].fill(false); }); });
+        return;
+      }
     }
 
-    // Grouping buttons
-    {
-      const grpOpts=[2,3,4,5,7], grpBtnW=22, grpBtnH=16;
-      const bpmLabelX2 = recBtnX + 10 + 14;
-      const bpmSliderX2 = bpmLabelX2 + 28;
-      const tapX2 = bpmSliderX2 + 100 + 36;
-      const tapW2 = 38;
-      const stepLabelX2 = tapX2 + tapW2 + 20;
-      const grpStartX = stepLabelX2 + 82;
-      grpOpts.forEach((n,gi)=>{
-        const bx=grpStartX+26+gi*(grpBtnW+3);
-        if(mouseX>bx&&mouseX<bx+grpBtnW&&mouseY>ctrlMid-grpBtnH/2&&mouseY<ctrlMid+grpBtnH/2){
-          seqGrouping=n;
-        }
-      });
-    }
+    // Clear buttons
+    GRIDS.forEach((_,gi)=>{
+      const cb=clearBtnRegion(gi, gridTop, rowH);
+      if(mouseX>cb.x&&mouseX<cb.x+cb.w&&mouseY>cb.y&&mouseY<cb.y+cb.h){
+        DRUMS.forEach(d=>{ seqGrid[gi][d.id].fill(false); });
+      }
+    });
 
     // Grid cells
-    const cellW=seqW/seqSteps, cellH=SEQ_ROW_H;
-    if(mouseY>=gridTop && mouseY<gridTop+DRUMS.length*cellH &&
-       mouseX>=margin+labelW && mouseX<margin+labelW+seqW){
+    GRIDS.forEach((g,gi)=>{
+      const gTop=gridY(gi,gridTop,rowH), gridH=DRUMS.length*rowH;
+      const cellW=seqW/g.steps;
+      if(mouseY<gTop||mouseY>gTop+gridH) return;
+      if(mouseX<gridLeft||mouseX>gridLeft+seqW) return;
+      const s=floor((mouseX-gridLeft)/cellW);
+      if(s<0||s>=g.steps) return;
       DRUMS.forEach((d,ri)=>{
-        const ry=gridTop+ri*cellH;
-        if(mouseY>=ry&&mouseY<ry+cellH){
-          const s=floor((mouseX-(margin+labelW))/cellW);
-          if(s>=0&&s<seqSteps) seqGrid[d.id][s]=!seqGrid[d.id][s];
-        }
+        const ry=gTop+ri*rowH;
+        if(mouseY>=ry&&mouseY<ry+rowH) seqGrid[gi][d.id][s]=!seqGrid[gi][d.id][s];
       });
-      return;
-    }
+    });
 
     // Pad region
     const {padW,padH,gap,startX,padY}=getPadLayout();
     for(let i=0;i<DRUMS.length;i++){
       const d=DRUMS[i], x=startX+i*(padW+gap);
       const has=drumCandidates[d.id].length>0;
-
       const tb=trimBarRegion(x,padY,padW);
       if(mouseY>tb.y&&mouseY<tb.y+tb.h&&has){
         const {startPx,endPx}=trimHandleX(x,padW,d.id);
@@ -819,19 +792,14 @@ function mouseReleased() { drag=null; }
 
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 
-const kbdMap = Object.fromEntries(DRUMS.map(d=>[d.kbd.toLowerCase(),d.id]));
+const kbdMap=Object.fromEntries(DRUMS.map(d=>[d.kbd.toLowerCase(),d.id]));
 
 function keyPressed(){
-  // Don't hijack events when the steps input is focused
-  if(document.activeElement === stepsInput.elt) return;
-
   if(phase==='ready'){
     const id=kbdMap[key.toLowerCase()];
     if(id){
-      triggerDrum(id);
-      padHeld[id]=true;
-      // If record is armed and sequencer is running, quantize to nearest step
-      if(seqRecording && seqPlaying) quantizeToStep(id);
+      triggerDrum(id); padHeld[id]=true;
+      if(seqRecording&&seqPlaying) quantizeToAllGrids(id);
     }
     if(key===' '){seqPlaying?stopSequencer():startSequencer();}
     if(key==='r'||key==='R') resetToIdle();
@@ -839,7 +807,6 @@ function keyPressed(){
   }
 }
 function keyReleased(){
-  if(document.activeElement === stepsInput.elt) return;
   const id=kbdMap[key.toLowerCase()];
   if(id) padHeld[id]=false;
 }
@@ -855,22 +822,6 @@ function handleTap(){
     for(let i=1;i<tapTimes.length;i++) intervals.push(tapTimes[i]-tapTimes[i-1]);
     seqBPM=constrain(60000/(intervals.reduce((a,b)=>a+b,0)/intervals.length),40,240);
   }
-}
-
-// ── Step count ────────────────────────────────────────────────────────────────
-
-function setStepCount(n){
-  const wasPlaying=seqPlaying;
-  if(wasPlaying) stopSequencer();
-  seqSteps=n;
-  DRUMS.forEach(d=>{
-    if(seqGrid[d.id].length<n)
-      seqGrid[d.id]=[...seqGrid[d.id],...new Array(n-seqGrid[d.id].length).fill(false)];
-    else
-      seqGrid[d.id]=seqGrid[d.id].slice(0,n);
-  });
-  seqCurrentStep=0;
-  if(wasPlaying) startSequencer();
 }
 
 // ── Recording pipeline ────────────────────────────────────────────────────────
@@ -908,8 +859,10 @@ async function submitAudio(blob){
   } catch(e){ errorMsg=e.message; phase='error'; return; }
 
   drumCandidates={}; drumIdx={};
-  DRUMS.forEach(d=>{drumCandidates[d.id]=[]; drumIdx[d.id]=0; drumTrimStart[d.id]=0; drumTrimEnd[d.id]=1;});
-
+  DRUMS.forEach(d=>{
+    drumCandidates[d.id]=[]; drumIdx[d.id]=0;
+    drumTrimStart[d.id]=0; drumTrimEnd[d.id]=1;
+  });
   for(const [id,info] of Object.entries(data.drums)){
     const decoded=[];
     for(const cand of info.candidates){
@@ -928,14 +881,11 @@ async function submitAudio(blob){
 // ── Playback ──────────────────────────────────────────────────────────────────
 
 function triggerDrum(id){
-  const cands=drumCandidates[id];
-  if(!cands||!cands.length) return;
-  const cand=cands[drumIdx[id]];
-  if(!cand) return;
+  const cands=drumCandidates[id]; if(!cands||!cands.length) return;
+  const cand=cands[drumIdx[id]]; if(!cand) return;
   if(audioCtx.state==='suspended') audioCtx.resume();
   const src=audioCtx.createBufferSource();
-  src.buffer=cand.buffer;
-  src.connect(gainNodes[id]);
+  src.buffer=cand.buffer; src.connect(gainNodes[id]);
   const dur=cand.buffer.duration;
   src.start(0,drumTrimStart[id]*dur,(drumTrimEnd[id]-drumTrimStart[id])*dur);
   padFlash[id]=millis();
@@ -950,7 +900,8 @@ function resetToIdle(){
     drumCandidates[d.id]=[]; drumIdx[d.id]=0;
     drumTrimStart[d.id]=0; drumTrimEnd[d.id]=1;
     padFlash[d.id]=-9999; padHeld[d.id]=false;
-    seqGrid[d.id]=new Array(seqSteps).fill(false);
   });
-  seqCurrentStep=0;
+  GRIDS.forEach((g,gi)=>{
+    DRUMS.forEach(d=>{ seqGrid[gi][d.id]=new Array(g.steps).fill(false); });
+  });
 }

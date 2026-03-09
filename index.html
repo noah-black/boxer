@@ -11,10 +11,30 @@
     html, body { width: 100%; height: 100%; overflow: hidden; background: #080810; }
     canvas { display: block; }
     #upload-input { display: none; }
+
+    #steps-input {
+      position: absolute;
+      background: transparent;
+      border: none;
+      border-bottom: 1px solid rgba(160,130,60,0.5);
+      color: rgba(245,200,80,0.9);
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 11px;
+      text-align: center;
+      width: 36px;
+      outline: none;
+      pointer-events: auto;
+      display: none;  /* shown by sketch once ready */
+      padding: 1px 2px;
+    }
+    #steps-input::-webkit-inner-spin-button,
+    #steps-input::-webkit-outer-spin-button { -webkit-appearance: none; }
+    #steps-input[type=number] { -moz-appearance: textfield; }
   </style>
 </head>
 <body>
   <input type="file" id="upload-input" accept="audio/*">
+  <input type="number" id="steps-input" min="3" max="128" value="16">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.3/p5.min.js"></script>
   <script src="sketch.js"></script>
 </body>

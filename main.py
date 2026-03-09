@@ -1,16 +1,9 @@
 """
 Drum Extractor — FastAPI backend
-Pipeline: audio → onset detection → CLAP embeddings → prototype nearest-neighbour
+Pipeline: audio -> onset detection -> CLAP embeddings -> prototype nearest-neighbour
 """
 
-import io
-import os
-import base64
-import logging
-import pathlib
-import subprocess
-import tempfile
-
+import io, os, base64, logging, pathlib, subprocess, tempfile
 import numpy as np
 import librosa
 import soundfile as sf
@@ -25,26 +18,26 @@ log = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-MODEL_ID   = "laion/larger_clap_general"
-SR         = 48_000
-CLIP_PRE   = 0.06
-CLIP_POST  = 0.45
-MIN_GAP    = 0.07
-MAX_CLIPS  = 150
-BATCH_SIZE = 32
-MAX_SECS   = 90
-FFMPEG     = os.environ.get("FFMPEG_PATH", "ffmpeg")
+MODEL_ID    = "laion/larger_clap_general"
+SR          = 48_000
+CLIP_PRE    = 0.06
+CLIP_POST   = 0.45
+MIN_GAP     = 0.07
+MAX_CLIPS   = 150
+BATCH_SIZE  = 32
+MAX_SECS    = 90
+N_CANDIDATES = 3   # runner-up candidates to return per drum slot
+FFMPEG      = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
-DRUM_NAMES = ["kick", "snare", "hihat", "tom"]
+DRUM_NAMES = ["kick", "snare", "hihat", "clap"]
 
 DRUM_TEXT_QUERIES: dict[str, list[str]] = {
     "kick":  ["kick drum", "bass drum", "low thud", "deep boom", "low frequency drum hit"],
     "snare": ["snare drum", "snare hit", "snappy crack", "rimshot", "sharp drum crack"],
     "hihat": ["hi-hat", "closed hi-hat", "metallic tick", "cymbal click", "sharp metallic percussion"],
-    "tom":   ["tom drum", "floor tom", "mid tom", "rack tom", "hollow drum hit"],
+    "clap":  ["clap", "hand clap", "finger snap", "rimshot clap", "percussive clap"],
 }
 
-# Put your reference WAVs in boxer/references/kick/, boxer/references/snare/, etc.
 REFERENCES_DIR = pathlib.Path(__file__).resolve().parent / "references"
 
 # ── Model loading ──────────────────────────────────────────────────────────────
@@ -60,13 +53,8 @@ log.info("CLAP model ready.")
 def _embed_audio_arrays(arrays: list[np.ndarray]) -> np.ndarray:
     all_embeds = []
     for i in range(0, len(arrays), BATCH_SIZE):
-        batch = arrays[i : i + BATCH_SIZE]
-        inputs = clap_processor(
-            audio=batch,
-            sampling_rate=SR,
-            return_tensors="pt",
-            padding=True,
-        )
+        batch  = arrays[i : i + BATCH_SIZE]
+        inputs = clap_processor(audio=batch, sampling_rate=SR, return_tensors="pt", padding=True)
         with torch.no_grad():
             out    = clap_model.audio_model(**inputs)
             embeds = clap_model.audio_projection(out.pooler_output)
@@ -85,45 +73,82 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
 
 # ── Prototype computation ──────────────────────────────────────────────────────
 
-def _build_prototypes() -> dict[str, np.ndarray]:
-    prototypes: dict[str, np.ndarray] = {}
+def _load_wav_files(paths) -> list[np.ndarray]:
+    """Load, trim, and fixed-length-pad a list of wav paths."""
+    clips = []
+    for p in paths:
+        try:
+            audio, _ = librosa.load(str(p), sr=SR, mono=True)
+            audio, _ = librosa.effects.trim(audio, top_db=30)
+            target   = int(CLIP_POST * SR)
+            audio    = audio[:target] if len(audio) > target else np.pad(audio, (0, target - len(audio)))
+            clips.append(audio)
+        except Exception as e:
+            log.warning(f"    Skipping {p.name}: {e}")
+    return clips
+
+
+def _make_proto(clips: list[np.ndarray]) -> np.ndarray:
+    embeds = _embed_audio_arrays(clips)
+    proto  = embeds.mean(axis=0)
+    return proto / np.linalg.norm(proto)
+
+
+def _build_prototypes() -> dict[str, list[np.ndarray]]:
+    """
+    Returns dict { drum -> [proto1, proto2, ...] }.
+
+    Folder layout (both are supported):
+
+      Flat  — references/kick/*.wav          => one prototype for kick
+      Multi — references/kick/studio/*.wav   => one prototype per subfolder
+              references/kick/beatbox/*.wav
+
+    Any .wav files sitting directly in references/kick/ are collected into
+    their own "default" prototype alongside any subfolders.
+    """
+    prototypes: dict[str, list[np.ndarray]] = {}
 
     for drum in DRUM_NAMES:
-        ref_dir   = REFERENCES_DIR / drum
-        wav_files = (sorted(ref_dir.glob("*.wav")) + sorted(ref_dir.glob("*.WAV"))) if ref_dir.exists() else []
+        ref_dir = REFERENCES_DIR / drum
+        drum_protos: list[np.ndarray] = []
 
-        if wav_files:
-            log.info(f"  {drum}: loading {len(wav_files)} reference files")
-            clips = []
-            for wav_path in wav_files:
-                try:
-                    audio, _ = librosa.load(str(wav_path), sr=SR, mono=True)
-                    audio, _ = librosa.effects.trim(audio, top_db=30)
-                    target   = int(CLIP_POST * SR)
-                    audio    = audio[:target] if len(audio) > target else np.pad(audio, (0, target - len(audio)))
-                    clips.append(audio)
-                except Exception as e:
-                    log.warning(f"    Skipping {wav_path.name}: {e}")
+        if ref_dir.exists():
+            # Subfolders → one prototype each
+            subfolders = [p for p in sorted(ref_dir.iterdir()) if p.is_dir()]
+            for sub in subfolders:
+                wavs = sorted(sub.glob("*.wav")) + sorted(sub.glob("*.WAV"))
+                if not wavs:
+                    continue
+                clips = _load_wav_files(wavs)
+                if clips:
+                    drum_protos.append(_make_proto(clips))
+                    log.info(f"  {drum}/{sub.name}: prototype from {len(clips)} files")
 
-            if clips:
-                embeds = _embed_audio_arrays(clips)
-                proto  = embeds.mean(axis=0)
-                proto  = proto / np.linalg.norm(proto)
-                prototypes[drum] = proto
-                log.info(f"  {drum}: prototype built from {len(clips)} files")
-                continue
+            # WAVs directly in the drum folder → one extra "flat" prototype
+            flat_wavs = sorted(ref_dir.glob("*.wav")) + sorted(ref_dir.glob("*.WAV"))
+            if flat_wavs:
+                clips = _load_wav_files(flat_wavs)
+                if clips:
+                    drum_protos.append(_make_proto(clips))
+                    log.info(f"  {drum}/. : prototype from {len(clips)} flat files")
 
-        log.warning(f"  {drum}: no reference audio in {ref_dir} -- using text fallback")
+        if drum_protos:
+            prototypes[drum] = drum_protos
+            log.info(f"  {drum}: {len(drum_protos)} prototype(s) total")
+            continue
+
+        # Fallback: text queries
+        log.warning(f"  {drum}: no reference audio found -- using text fallback")
         embeds = _embed_texts(DRUM_TEXT_QUERIES[drum])
         proto  = embeds.mean(axis=0)
-        proto  = proto / np.linalg.norm(proto)
-        prototypes[drum] = proto
+        prototypes[drum] = [proto / np.linalg.norm(proto)]
 
     return prototypes
 
 
 log.info("Building drum prototypes...")
-PROTOTYPES = _build_prototypes()
+PROTOTYPES: dict[str, list[np.ndarray]] = _build_prototypes()
 log.info("Prototypes ready.")
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -165,8 +190,8 @@ def clip_to_b64_wav(clip: np.ndarray) -> str:
 # ── DSP ────────────────────────────────────────────────────────────────────────
 
 def detect_onsets(audio: np.ndarray) -> np.ndarray:
-    hop    = 256
-    frames = librosa.onset.onset_detect(y=audio, sr=SR, hop_length=hop, backtrack=False, units="frames")
+    hop     = 256
+    frames  = librosa.onset.onset_detect(y=audio, sr=SR, hop_length=hop, backtrack=False, units="frames")
     samples = librosa.frames_to_samples(frames, hop_length=hop)
 
     search_back = int(0.04 * SR)
@@ -175,15 +200,13 @@ def detect_onsets(audio: np.ndarray) -> np.ndarray:
         lo     = max(0, s - search_back)
         window = audio[lo : s + 1]
         if len(window) == 0:
-            snapped.append(int(s))
-            continue
+            snapped.append(int(s)); continue
         peak      = np.max(np.abs(window))
         threshold = peak * 0.2
         true_start = s
         for j in range(len(window) - 1, -1, -1):
             if abs(window[j]) < threshold:
-                true_start = lo + j
-                break
+                true_start = lo + j; break
         snapped.append(int(true_start))
 
     min_gap = int(MIN_GAP * SR)
@@ -191,22 +214,21 @@ def detect_onsets(audio: np.ndarray) -> np.ndarray:
     last = -min_gap
     for s in sorted(snapped):
         if s - last >= min_gap:
-            deduped.append(int(s))
-            last = s
+            deduped.append(int(s)); last = s
 
     if not deduped:
         return np.array([], dtype=int)
 
     if len(deduped) > MAX_CLIPS:
         clip_len = int((CLIP_PRE + CLIP_POST) * SR)
-        energies = [float(np.sqrt(np.mean(audio[max(0, s - int(CLIP_PRE*SR)) : max(0, s - int(CLIP_PRE*SR)) + clip_len] ** 2))) for s in deduped]
+        energies = [float(np.sqrt(np.mean(audio[max(0, s-int(CLIP_PRE*SR)) : max(0, s-int(CLIP_PRE*SR))+clip_len]**2))) for s in deduped]
         order    = np.argsort(energies)[::-1][:MAX_CLIPS]
         deduped  = [deduped[i] for i in sorted(order)]
 
     return np.array(deduped, dtype=int)
 
 
-def extract_clips(audio: np.ndarray, onsets: np.ndarray) -> tuple[list[np.ndarray], list[float]]:
+def extract_clips(audio: np.ndarray, onsets: np.ndarray):
     pre      = int(CLIP_PRE * SR)
     clip_len = int((CLIP_PRE + CLIP_POST) * SR)
     clips, times = [], []
@@ -221,8 +243,7 @@ def extract_clips(audio: np.ndarray, onsets: np.ndarray) -> tuple[list[np.ndarra
         peak = np.max(np.abs(clip))
         if peak > 1e-6:
             clip = clip / peak * 0.9
-        clips.append(clip)
-        times.append(float(start) / SR)
+        clips.append(clip); times.append(float(start) / SR)
     return clips, times
 
 # ── Route ──────────────────────────────────────────────────────────────────────
@@ -247,28 +268,94 @@ async def analyze(file: UploadFile = File(...)):
     clips, times = extract_clips(audio, onsets)
 
     log.info(f"Embedding {len(clips)} clips...")
-    audio_embeds = _embed_audio_arrays(clips)              # (n_clips, D)
-    proto_matrix = np.stack([PROTOTYPES[d] for d in DRUM_NAMES])  # (n_drums, D)
-    scores       = audio_embeds @ proto_matrix.T           # (n_clips, n_drums)
+    audio_embeds = _embed_audio_arrays(clips)   # (n_clips, D)
 
-    primary = np.argmax(scores, axis=1)
+    # Multi-prototype scoring: for each drum, score each clip against every
+    # prototype for that drum and take the max.  This means a clip can match
+    # via *any* style prototype (studio, beatbox, found-sound, …).
+    scores = np.zeros((len(clips), len(DRUM_NAMES)), dtype=np.float32)
+    for di, drum in enumerate(DRUM_NAMES):
+        protos = PROTOTYPES[drum]                          # list of (D,) vectors
+        proto_matrix = np.stack(protos)                   # (n_protos, D)
+        per_proto    = audio_embeds @ proto_matrix.T      # (n_clips, n_protos)
+        scores[:, di] = per_proto.max(axis=1)             # best proto wins
+
+    # ── Two-pass assignment ────────────────────────────────────────────────────
+    #
+    # Pass 1 (clip-first): each clip votes for its top drum type.
+    #   Group clips by their primary vote; each drum picks its best.
+    #
+    # Pass 2 (fallback): any drum that got zero votes in pass 1 gets the
+    #   highest-scoring unused clip for that drum type, regardless of what
+    #   that clip voted for. Ensures we always try to fill every slot.
+
+    primary = np.argmax(scores, axis=1)   # (n_clips,) — each clip's top drum
+
+    # Build per-drum sorted candidate lists (by that drum's score, descending)
+    all_candidates: dict[str, list[tuple[float, int]]] = {
+        d: sorted(
+            [(float(scores[i, di]), i) for i in range(len(clips))],
+            key=lambda x: -x[0]
+        )
+        for di, d in enumerate(DRUM_NAMES)
+    }
+
+    # Pass 1 — clip-first groups
     groups: dict[str, list[tuple[float, int]]] = {d: [] for d in DRUM_NAMES}
     for clip_idx, drum_idx in enumerate(primary):
         drum = DRUM_NAMES[drum_idx]
         groups[drum].append((float(scores[clip_idx, drum_idx]), clip_idx))
 
+    # Select winners from pass 1
+    winners: dict[str, tuple[float, int]] = {}   # drum -> (score, clip_idx)
+    used: set[int] = set()
+    for drum in DRUM_NAMES:
+        if groups[drum]:
+            best = max(groups[drum], key=lambda x: x[0])
+            winners[drum] = best
+            used.add(best[1])
+
+    # Pass 2 — fallback for unmatched drums
+    for drum in DRUM_NAMES:
+        if drum not in winners:
+            for score, clip_idx in all_candidates[drum]:
+                if clip_idx not in used:
+                    winners[drum] = (score, clip_idx)
+                    used.add(clip_idx)
+                    log.info(f"  {drum}: filled via fallback (score={score:.3f})")
+                    break
+
+    # Build results with top-N candidates per drum for runner-up swapping
     results: dict = {}
     for drum in DRUM_NAMES:
-        if not groups[drum]:
-            log.info(f"  {drum}: no clips matched")
+        if drum not in winners:
+            log.info(f"  {drum}: could not fill (not enough distinct clips)")
             continue
-        best_score, best_idx = max(groups[drum], key=lambda x: x[0])
-        results[drum] = {
-            "audio": clip_to_b64_wav(clips[best_idx]),
-            "time":  round(times[best_idx], 3),
-            "score": round(best_score, 4),
-        }
-        log.info(f"  {drum}: @{times[best_idx]:.2f}s  score={best_score:.3f}  ({len(groups[drum])} clips)")
+
+        _, winner_idx = winners[drum]
+
+        # Gather top-N candidates: winner first, then next best unused clips
+        candidate_list = []
+        seen_in_candidates: set[int] = {winner_idx}
+        candidate_list.append(winner_idx)
+
+        for score, clip_idx in all_candidates[drum]:
+            if len(candidate_list) >= N_CANDIDATES:
+                break
+            if clip_idx not in seen_in_candidates:
+                candidate_list.append(clip_idx)
+                seen_in_candidates.add(clip_idx)
+
+        candidates_out = []
+        for clip_idx in candidate_list:
+            candidates_out.append({
+                "audio": clip_to_b64_wav(clips[clip_idx]),
+                "time":  round(times[clip_idx], 3),
+                "score": round(float(scores[clip_idx, DRUM_NAMES.index(drum)]), 4),
+            })
+
+        results[drum] = {"candidates": candidates_out}
+        log.info(f"  {drum}: winner @{times[winner_idx]:.2f}s  score={scores[winner_idx, DRUM_NAMES.index(drum)]:.3f}  ({len(groups[drum])} primary clips)")
 
     return {"drums": results, "onset_count": len(clips)}
 

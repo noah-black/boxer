@@ -8,7 +8,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 import torch
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from transformers import ClapModel, ClapProcessor
@@ -276,7 +276,7 @@ def extract_clips(audio: np.ndarray, onsets: np.ndarray):
 # ── Route ──────────────────────────────────────────────────────────────────────
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
+async def analyze(file: UploadFile = File(...), custom_texts: str = Form(default="{}")):
     raw      = await file.read()
     audio    = load_audio(raw)
     duration = len(audio) / SR
@@ -383,6 +383,34 @@ async def analyze(file: UploadFile = File(...)):
 
         results[drum] = {"candidates": candidates_out}
         log.info(f"  {drum}: winner @{times[winner_idx]:.2f}s  score={scores[winner_idx, DRUM_NAMES.index(drum)]:.3f}  ({len(groups[drum])} primary clips)")
+
+    # ── Custom text-query slots ────────────────────────────────────────────────
+    import json as _json
+    try:
+        custom = _json.loads(custom_texts)   # {id: text, ...}
+    except Exception:
+        custom = {}
+
+    for slot_id, query_text in custom.items():
+        if not query_text or not query_text.strip():
+            continue
+        try:
+            text_embed = _embed_texts([query_text.strip()])   # (1, D)
+            sims       = (audio_embeds @ text_embed.T).squeeze()  # (n_clips,)
+            if sims.ndim == 0:
+                sims = sims.reshape(1)
+            top_idx = np.argsort(sims)[::-1][:N_CANDIDATES]
+            candidates_out = []
+            for idx in top_idx:
+                candidates_out.append({
+                    "audio": clip_to_b64_wav(clips[int(idx)]),
+                    "time":  round(float(times[int(idx)]), 3),
+                    "score": round(float(sims[int(idx)]), 4),
+                })
+            results[slot_id] = {"candidates": candidates_out}
+            log.info(f"  {slot_id} ('{query_text}'): top score={float(sims[top_idx[0]]):.3f}")
+        except Exception as e:
+            log.warning(f"  {slot_id}: text embedding failed: {e}")
 
     return {"drums": results, "onset_count": len(clips)}
 

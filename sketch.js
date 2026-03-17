@@ -1,8 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
-:/ BOXER — drum extractor + polymetric sequencer
+// BOXER — drum extractor + polymetric sequencer
 // ─────────────────────────────────────────────────────────────────────────────
 
-const BACKEND = 'http://localhost:8000';
+const BACKEND = 'https://noahblack--boxer-fastapi-app.modal.run';
 const N_CANDIDATES = 3;
 
 // Standard audio-extracted drums (top row: A S D F)

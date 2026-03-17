@@ -61,8 +61,9 @@ app = modal.App("boxer", image=image)
 # ── ASGI entrypoint ───────────────────────────────────────────────────────────
 
 @app.function(
+    gpu="T4",            # CLAP + Whisper inference; T4 has 16 GB VRAM
     cpu=2,
-    memory=8192,         # CLAP needs ~2–3 GB; give headroom
+    memory=4096,         # audio processing + numpy; models live in GPU VRAM
     timeout=600,         # 10-minute max for long uploads
     min_containers=1,    # keep one container alive for session cache
     scaledown_window=300,

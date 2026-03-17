@@ -48,10 +48,15 @@ DRUM_TEXT_QUERIES: dict[str, list[str]] = {
 
 REFERENCES_DIR = pathlib.Path(__file__).resolve().parent / "references"
 
+# ── Device ─────────────────────────────────────────────────────────────────────
+
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+log.info(f"Device: {_DEVICE}")
+
 # ── Model loading ──────────────────────────────────────────────────────────────
 
 log.info("Loading CLAP model...")
-clap_model     = ClapModel.from_pretrained(MODEL_ID)
+clap_model     = ClapModel.from_pretrained(MODEL_ID).to(_DEVICE)
 clap_processor = ClapProcessor.from_pretrained(MODEL_ID)
 clap_model.eval()
 log.info("CLAP model ready.")
@@ -61,11 +66,12 @@ log.info("CLAP model ready.")
 def _embed_batch(arrays: list[np.ndarray]) -> np.ndarray:
     """Embed a single batch (no internal loop). Returns (n, D) ndarray."""
     inputs = clap_processor(audio=arrays, sampling_rate=SR, return_tensors="pt", padding=True)
+    inputs = {k: v.to(_DEVICE) for k, v in inputs.items()}
     with torch.no_grad():
         out    = clap_model.audio_model(**inputs)
         embeds = clap_model.audio_projection(out.pooler_output)
         embeds = embeds / embeds.norm(dim=-1, keepdim=True)
-    return embeds.numpy()
+    return embeds.cpu().numpy()
 
 def _embed_audio_arrays(arrays: list[np.ndarray]) -> np.ndarray:
     return np.vstack([_embed_batch(arrays[i:i+BATCH_SIZE])
@@ -74,11 +80,12 @@ def _embed_audio_arrays(arrays: list[np.ndarray]) -> np.ndarray:
 
 def _embed_texts(texts: list[str]) -> np.ndarray:
     inputs = clap_processor(text=texts, return_tensors="pt", padding=True)
+    inputs = {k: v.to(_DEVICE) for k, v in inputs.items()}
     with torch.no_grad():
         out    = clap_model.text_model(**inputs)
         embeds = clap_model.text_projection(out.pooler_output)
         embeds = embeds / embeds.norm(dim=-1, keepdim=True)
-    return embeds.numpy()
+    return embeds.cpu().numpy()
 
 # ── Prototype computation ──────────────────────────────────────────────────────
 

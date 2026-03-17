@@ -256,6 +256,11 @@ function setup() {
   // Start with one 16-step grid; more can be added at runtime
   _nextSteps[0] = 0;
   ALL_DRUMS.forEach(d => { grids[0].cells[d.id] = new Array(16).fill(false); });
+
+  // Initial positioning — windowResized() is not called on first load
+  positionCustomInputs();
+  positionAddGridInput();
+  updateElementVisibility();
 }
 
 function windowResized() {

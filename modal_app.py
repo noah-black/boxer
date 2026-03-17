@@ -9,9 +9,14 @@ survive between requests.
 
 import modal
 
+# ── App identity — change this one constant to rename the app everywhere ───────
+
+APP_NAME = "boxer"
+DOMAIN   = "boxer.noah.black"
+
 # ── Image ─────────────────────────────────────────────────────────────────────
 
-MODEL_ID     = "laion/larger_clap_general"
+MODEL_ID      = "laion/larger_clap_general"
 WHISPER_MODEL = "base"
 
 image = (
@@ -56,7 +61,7 @@ image = (
     .add_local_file("sketch.js",     "/app/sketch.js")
 )
 
-app = modal.App("boxer", image=image)
+app = modal.App(APP_NAME, image=image)
 
 # ── ASGI entrypoint ───────────────────────────────────────────────────────────
 

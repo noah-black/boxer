@@ -409,7 +409,7 @@ function positionCustomInputs() {
 function updateElementVisibility() {
   const show = (phase === 'ready' || phase === 'recording');
   customInputEls.forEach((el, i) => {
-    show ? el.show() : el.hide();
+    el.elt.style.display = show ? 'block' : 'none';  // el.show() only clears inline style, reverting to CSS display:none
     lyricsCheckEls[i].style.display = show ? 'flex' : 'none';
   });
   addGridInputEl.style.display = show ? 'block' : 'none';

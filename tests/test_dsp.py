@@ -12,7 +12,7 @@ import main
 from main import (
     SR, CLIP_PRE, CLIP_POST_MIN, CLIP_POST_MAX, EMBED_WINDOW,
     CLIP_MARGIN, MIN_GAP, MAX_CLIPS,
-    detect_onsets, extract_clips, build_context_clip,
+    detect_onsets, extract_clips, clip_to_ctx_times,
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -174,49 +174,52 @@ class TestExtractClips:
             assert ends[i] <= int(onsets[i + 1]) + pre + 1
 
 
-# ── build_context_clip ────────────────────────────────────────────────────────
+# ── clip_to_ctx_times ─────────────────────────────────────────────────────────
 
-class TestBuildContextClip:
+class TestClipToCtxTimes:
 
     def _make_ctx(self, clip_start, clip_end, audio_len=int(4.0 * SR)):
         audio = np.random.randn(audio_len).astype(np.float32)
-        return build_context_clip(audio, clip_start, clip_end), audio, clip_start, clip_end
+        # Ensure there's a nonzero peak so norm_gain is meaningful
+        audio[clip_start] = 0.5
+        return clip_to_ctx_times(audio, clip_start, clip_end), audio, clip_start, clip_end
 
-    def test_trim_fractions_in_range(self):
-        (ctx, t_start, t_end), *_ = self._make_ctx(int(1.0 * SR), int(1.2 * SR))
-        assert 0.0 <= t_start < t_end <= 1.0
+    def test_ctx_times_within_audio_bounds(self):
+        audio_len = int(4.0 * SR)
+        audio = np.random.randn(audio_len).astype(np.float32)
+        cs, ce = int(1.0 * SR), int(1.2 * SR)
+        ctx = clip_to_ctx_times(audio, cs, ce)
+        assert ctx["ctx_start_s"] >= 0.0
+        assert ctx["ctx_end_s"]   <= audio_len / SR + 1e-6
 
-    def test_trim_fractions_locate_original(self):
-        """t_start and t_end must point to the original clip's sample range within ctx."""
+    def test_ctx_times_trim_fractions_locate_original(self):
+        """trim_start and trim_end must correctly bracket the original clip."""
         cs, ce = int(1.0 * SR), int(1.3 * SR)
-        (ctx, t_start, t_end), audio, _, _ = self._make_ctx(cs, ce)
-        ctx_len = len(ctx)
+        audio_len = int(4.0 * SR)
+        audio = np.random.randn(audio_len).astype(np.float32)
+        ctx = clip_to_ctx_times(audio, cs, ce)
+
         margin  = int(CLIP_MARGIN * SR)
         ctx_s   = max(0, cs - margin)
+        ctx_e   = min(audio_len, ce + margin)
+        ctx_len = ctx_e - ctx_s
 
         expected_t_start = (cs - ctx_s) / ctx_len
         expected_t_end   = (ce - ctx_s) / ctx_len
 
-        # Allow 1-sample rounding error from the round() calls in build_context_clip
-        assert abs(t_start - expected_t_start) < 2 / ctx_len
-        assert abs(t_end   - expected_t_end)   < 2 / ctx_len
+        assert abs(ctx["trim_start"] - expected_t_start) < 2 / ctx_len
+        assert abs(ctx["trim_end"]   - expected_t_end)   < 2 / ctx_len
+        assert 0.0 <= ctx["trim_start"] < ctx["trim_end"] <= 1.0
 
-    def test_normalised(self):
-        (ctx, _, _), *_ = self._make_ctx(int(1.0 * SR), int(1.2 * SR))
-        assert np.max(np.abs(ctx)) <= 0.9 + 1e-5
+    def test_ctx_times_norm_gain_positive(self):
+        ctx, *_ = self._make_ctx(int(1.0 * SR), int(1.2 * SR))
+        assert ctx["norm_gain"] > 0.0
 
-    def test_clip_at_audio_start(self):
-        """Clip at position 0 — no left margin available."""
-        cs, ce = 0, int(0.1 * SR)
-        (ctx, t_start, t_end), *_ = self._make_ctx(cs, ce, audio_len=int(2.0 * SR))
-        assert t_start == 0.0
-        assert t_end > 0.0
-
-    def test_clip_at_audio_end(self):
-        """Clip at the very end of audio — no right margin available."""
+    def test_ctx_times_short_audio_clamped(self):
+        """When clip is near the start, ctx_start_s is 0."""
         audio_len = int(2.0 * SR)
-        ce        = audio_len
-        cs        = audio_len - int(0.1 * SR)
-        (ctx, t_start, t_end), *_ = self._make_ctx(cs, ce, audio_len=audio_len)
-        assert t_end == 1.0
-        assert t_start < 1.0
+        audio = np.random.randn(audio_len).astype(np.float32)
+        cs, ce = 0, int(0.1 * SR)
+        ctx = clip_to_ctx_times(audio, cs, ce)
+        assert ctx["ctx_start_s"] == 0.0
+        assert ctx["trim_start"] == 0.0

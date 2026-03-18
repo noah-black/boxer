@@ -50,12 +50,22 @@ def _audio_to_wav_bytes(audio: np.ndarray) -> bytes:
 def _post_analyze(audio: np.ndarray, custom_texts: dict = None):
     """POST /analyze with mock load_audio bypassing ffmpeg."""
     wav = _audio_to_wav_bytes(audio)
-    with patch.object(main, "load_audio", return_value=audio), \
-         patch.object(main, "transcribe_audio", return_value=[]):
+    with patch.object(main, "load_audio", return_value=audio):
         data = {}
         if custom_texts:
             data["custom_texts"] = json.dumps(custom_texts)
         return client.post("/analyze", files={"file": ("audio.wav", wav, "audio/wav")}, data=data)
+
+
+def _post_transcribe(audio: np.ndarray):
+    """POST /transcribe with mock load_audio bypassing ffmpeg."""
+    wav = _audio_to_wav_bytes(audio)
+    with patch.object(main, "load_audio", return_value=audio), \
+         patch.object(main, "transcribe_audio", return_value=[
+             {"word": "kick", "start": 0.1, "end": 0.3},
+             {"word": "snare", "start": 0.5, "end": 0.7},
+         ]):
+        return client.post("/transcribe", files={"file": ("audio.wav", wav, "audio/wav")})
 
 
 # ── /analyze ──────────────────────────────────────────────────────────────────
@@ -69,8 +79,8 @@ class TestAnalyze:
         body = resp.json()
         assert "drums"        in body
         assert "onset_count"  in body
-        assert "transcript"   in body
         assert "session_id"   in body
+        assert "transcript" not in body
         assert isinstance(body["session_id"], str)
         assert isinstance(body["onset_count"], int)
         assert body["onset_count"] > 0
@@ -84,13 +94,14 @@ class TestAnalyze:
             cands = info["candidates"]
             assert len(cands) >= 1
             for c in cands:
-                assert "audio"      in c
+                assert "audio"      not in c
                 assert "score"      in c
                 assert "time"       in c
-                assert "trim_start" in c
-                assert "trim_end"   in c
-                # audio field must be a valid base64 string
-                base64.b64decode(c["audio"])
+                assert "ctx_start_s" in c
+                assert "ctx_end_s"   in c
+                assert "trim_start"  in c
+                assert "trim_end"    in c
+                assert "norm_gain"   in c
 
     def test_candidate_trim_fractions_in_range(self):
         audio = _make_audio()
@@ -98,6 +109,16 @@ class TestAnalyze:
         for slot_id, info in resp.json()["drums"].items():
             for c in info["candidates"]:
                 assert 0.0 <= c["trim_start"] < c["trim_end"] <= 1.0
+
+    def test_candidate_ctx_times_in_range(self):
+        audio = _make_audio()
+        resp  = _post_analyze(audio)
+        duration = len(audio) / main.SR
+        for slot_id, info in resp.json()["drums"].items():
+            for c in info["candidates"]:
+                assert c["ctx_start_s"] >= 0.0
+                assert c["ctx_end_s"]   <= duration + 0.001
+                assert c["norm_gain"]   > 0.0
 
     def test_session_id_is_stored(self):
         audio = _make_audio()
@@ -108,8 +129,7 @@ class TestAnalyze:
     def test_too_short_returns_400(self):
         # 0.2 s — below the 0.5 s minimum
         audio = np.zeros(int(0.2 * SR), dtype=np.float32)
-        with patch.object(main, "load_audio", return_value=audio), \
-             patch.object(main, "transcribe_audio", return_value=[]):
+        with patch.object(main, "load_audio", return_value=audio):
             resp = client.post("/analyze",
                                files={"file": ("a.wav", b"x", "audio/wav")})
         assert resp.status_code == 400
@@ -117,8 +137,7 @@ class TestAnalyze:
     def test_no_onsets_returns_422(self):
         # Pure silence — no transients
         audio = np.zeros(int(1.5 * SR), dtype=np.float32)
-        with patch.object(main, "load_audio", return_value=audio), \
-             patch.object(main, "transcribe_audio", return_value=[]):
+        with patch.object(main, "load_audio", return_value=audio):
             resp = client.post("/analyze",
                                files={"file": ("a.wav", b"x", "audio/wav")})
         assert resp.status_code == 422
@@ -141,23 +160,22 @@ class TestAnalyze:
         assert "custom_0" not in drums
         assert "custom_1" in drums
 
-    def test_transcript_is_list(self):
-        audio = _make_audio()
-        resp  = _post_analyze(audio)
-        assert isinstance(resp.json()["transcript"], list)
-
     def test_malformed_custom_texts_still_returns_200(self):
         # An invalid JSON string in custom_texts shouldn't crash the server.
         # (json.loads raises — route should handle or default to {})
         audio = _make_audio()
         wav   = _audio_to_wav_bytes(audio)
-        with patch.object(main, "load_audio", return_value=audio), \
-             patch.object(main, "transcribe_audio", return_value=[]):
+        with patch.object(main, "load_audio", return_value=audio):
             resp = client.post("/analyze",
                                files={"file": ("a.wav", wav, "audio/wav")},
                                data={"custom_texts": "{bad json"})
         # Either 200 (graceful default) or 400/422 — must not be 500
         assert resp.status_code != 500
+
+    def test_transcript_not_in_response(self):
+        audio = _make_audio()
+        resp  = _post_analyze(audio)
+        assert "transcript" not in resp.json()
 
 
 # ── /record-custom ────────────────────────────────────────────────────────────
@@ -213,21 +231,10 @@ class TestQueryCustom:
         audio = _make_audio()
         main._sessions[sid] = {
             "audio_embeds": np.random.randn(n_clips, D).astype(np.float32),
-            "output_clips": [np.zeros(int(0.1 * SR), dtype=np.float32)] * n_clips,
             "times":        [i * 0.3 for i in range(n_clips)],
             "transcript": [
-                {
-                    "word": "kick",
-                    "start": 0.1, "end": 0.3,
-                    "raw_end_samps": int(0.2 * SR),
-                    "audio": main.clip_to_b64_wav(np.zeros(int(0.2 * SR), dtype=np.float32)),
-                },
-                {
-                    "word": "snare",
-                    "start": 0.5, "end": 0.7,
-                    "raw_end_samps": int(0.2 * SR),
-                    "audio": main.clip_to_b64_wav(np.zeros(int(0.2 * SR), dtype=np.float32)),
-                },
+                {"word": "kick",  "start": 0.1, "end": 0.3},
+                {"word": "snare", "start": 0.5, "end": 0.7},
             ],
             "audio_raw":   audio,
             "clip_starts": [int(i * 0.3 * SR) for i in range(n_clips)],
@@ -245,9 +252,14 @@ class TestQueryCustom:
         assert body["mode"] == "clap"
         assert len(body["candidates"]) >= 1
         for c in body["candidates"]:
-            assert "audio" in c
-            assert "score" in c
-            assert "time"  in c
+            assert "audio"      not in c
+            assert "score"      in c
+            assert "time"       in c
+            assert "ctx_start_s" in c
+            assert "ctx_end_s"   in c
+            assert "trim_start"  in c
+            assert "trim_end"    in c
+            assert "norm_gain"   in c
 
     def test_lyrics_mode_returns_transcript_match(self):
         sid  = self._make_session()
@@ -258,6 +270,11 @@ class TestQueryCustom:
         assert body["mode"]    == "lyrics"
         assert body["matches"] >= 1
         assert len(body["candidates"]) >= 1
+        for c in body["candidates"]:
+            assert "word"  in c
+            assert "start" in c
+            assert "end"   in c
+            assert "audio" not in c
 
     def test_lyrics_mode_no_match_returns_empty(self):
         sid  = self._make_session()
@@ -287,3 +304,39 @@ class TestQueryCustom:
                                  "mode": "clap", "top_k": "2"})
         assert resp.status_code == 200
         assert len(resp.json()["candidates"]) <= 2
+
+
+# ── /transcribe ───────────────────────────────────────────────────────────────
+
+class TestTranscribe:
+
+    def test_transcribe_returns_words_list(self):
+        audio = _make_audio()
+        resp  = _post_transcribe(audio)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "words" in body
+        assert isinstance(body["words"], list)
+
+    def test_transcribe_words_have_correct_fields(self):
+        audio = _make_audio()
+        resp  = _post_transcribe(audio)
+        for w in resp.json()["words"]:
+            assert "word"  in w
+            assert "start" in w
+            assert "end"   in w
+
+    def test_transcribe_no_audio_in_words(self):
+        audio = _make_audio()
+        resp  = _post_transcribe(audio)
+        for w in resp.json()["words"]:
+            assert "audio" not in w
+
+    def test_transcribe_empty_audio_returns_empty_words(self):
+        audio = _make_audio()
+        wav   = _audio_to_wav_bytes(audio)
+        with patch.object(main, "load_audio", return_value=audio), \
+             patch.object(main, "transcribe_audio", return_value=[]):
+            resp = client.post("/transcribe", files={"file": ("audio.wav", wav, "audio/wav")})
+        assert resp.status_code == 200
+        assert resp.json()["words"] == []

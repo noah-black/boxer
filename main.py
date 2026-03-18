@@ -221,7 +221,7 @@ def transcribe_audio(audio: np.ndarray) -> list[dict]:
     result = model.transcribe(
         audio_16k.astype(np.float32),
         word_timestamps=True,
-        fp16=False,
+        fp16=torch.cuda.is_available(),
         language="en",
     )
     words: list[dict] = []
@@ -231,21 +231,12 @@ def transcribe_audio(audio: np.ndarray) -> list[dict]:
             clean = raw.lower().strip(_STRIP_CHARS)
             if not clean:
                 continue
-            start_s = float(w["start"])
-            end_s   = min(float(w["end"]) + LYRIC_POST_ROLL, len(audio) / SR)
-            s_samp  = max(0, int(start_s * SR))
-            e_samp  = min(len(audio), int(end_s * SR))
-            clip    = audio[s_samp:e_samp].copy()
-            peak    = np.max(np.abs(clip))
-            if peak > 1e-6:
-                clip = clip / peak * 0.9
+            start_s   = float(w["start"])
             raw_end_s = float(w["end"])
             words.append({
-                "word":          clean,
-                "start":         round(start_s, 3),
-                "end":           round(raw_end_s, 3),
-                "raw_end_samps": int((raw_end_s - start_s) * SR),  # samples to keep when merging
-                "audio":         clip_to_b64_wav(clip),
+                "word":  clean,
+                "start": round(start_s, 3),
+                "end":   round(raw_end_s, 3),
             })
             if len(words) >= MAX_LYRIC_WORDS:
                 return words
@@ -264,18 +255,17 @@ import time as _time, uuid as _uuid
 SESSION_TTL = 1800
 _sessions: dict = {}
 
-def _new_session(audio_embeds, output_clips, times, transcript,
+def _new_session(audio_embeds, times, transcript,
                   audio_raw, clip_starts, clip_ends) -> str:
     sid = str(_uuid.uuid4())
     _sessions[sid] = {
         "audio_embeds": audio_embeds,
-        "output_clips": output_clips,
         "times":        times,
         "transcript":   transcript,
         "audio_raw":    audio_raw,
         "clip_starts":  clip_starts,
         "clip_ends":    clip_ends,
-        "last_access":           _time.time(),
+        "last_access":  _time.time(),
     }
     now = _time.time()
     for k in list(_sessions.keys()):
@@ -415,22 +405,25 @@ def extract_clips(audio: np.ndarray, onsets: np.ndarray):
 
     return embed_clips, output_clips, times, clip_starts, clip_ends
 
-def build_context_clip(audio: np.ndarray, clip_start: int, clip_end: int):
-    """Return a wider audio slice with CLIP_MARGIN on each side, plus the
-    trim fractions that locate the original clip within it.
-    The context clip is peak-normalised over the full context window.
+def clip_to_ctx_times(audio: np.ndarray, clip_start: int, clip_end: int) -> dict:
+    """Return context window boundaries as seconds + trim fractions + norm_gain.
+    The client uses these to extract the clip from its own decoded AudioBuffer.
     """
     margin  = int(CLIP_MARGIN * SR)
     ctx_s   = max(0, clip_start - margin)
     ctx_e   = min(len(audio), clip_end + margin)
-    ctx     = audio[ctx_s:ctx_e].copy()
-    peak    = np.max(np.abs(ctx))
-    if peak > 1e-6:
-        ctx = ctx / peak * 0.9
-    ctx_len = len(ctx)
-    t_start = (clip_start - ctx_s) / ctx_len
-    t_end   = (clip_end   - ctx_s) / ctx_len
-    return ctx, round(float(t_start), 4), round(float(t_end), 4)
+    ctx_len = ctx_e - ctx_s
+    peak    = float(np.max(np.abs(audio[ctx_s:ctx_e]))) if ctx_len > 0 else 0.0
+    norm_gain = round(0.9 / peak, 4) if peak > 1e-6 else 1.0
+    t_start = (clip_start - ctx_s) / ctx_len if ctx_len > 0 else 0.0
+    t_end   = (clip_end   - ctx_s) / ctx_len if ctx_len > 0 else 1.0
+    return {
+        "ctx_start_s": round(ctx_s / SR, 4),
+        "ctx_end_s":   round(ctx_e / SR, 4),
+        "trim_start":  round(float(t_start), 4),
+        "trim_end":    round(float(t_end), 4),
+        "norm_gain":   norm_gain,
+    }
 
 # ── Analyze helpers ────────────────────────────────────────────────────────────
 
@@ -440,25 +433,20 @@ def run_drum_assignment(
     times: list[float],
     clip_starts: list[int],
     clip_ends: list[int],
-    can_early_exit: bool,
 ) -> tuple[np.ndarray, dict, int]:
     """Embed clips with CLAP, score against drum prototypes, assign via two-pass
     nearest-neighbour, and build the candidates_out payload for each drum slot.
 
     Returns (audio_embeds, drum_results, n_embedded).
-    Caller should trim output_clips / times / clip_starts / clip_ends to
+    Caller should trim times / clip_starts / clip_ends to
     [:n_embedded] — those lists are not modified here.
     """
     proto_matrices = {d: np.stack(PROTOTYPES[d]) for d in DRUM_NAMES}
     n_clips      = len(embed_clips)
     embeds_list: list[np.ndarray] = []
     n_embedded   = 0
-    drums_locked: set[str] = set()
 
-    log.info(
-        f"Embedding up to {n_clips} clips ({EMBED_WINDOW*1000:.0f}ms windows)"
-        f"{'  [early exit enabled]' if can_early_exit else '  [full scan — custom queries present]'}..."
-    )
+    log.info(f"Embedding {n_clips} clips ({EMBED_WINDOW*1000:.0f}ms windows)...")
 
     for batch_start in range(0, n_clips, BATCH_SIZE):
         batch        = embed_clips[batch_start : batch_start + BATCH_SIZE]
@@ -469,16 +457,6 @@ def run_drum_assignment(
             batch_embeds[bad] = 0.0
         embeds_list.append(batch_embeds)
         n_embedded += len(batch)
-
-        if can_early_exit and n_embedded >= EARLY_EXIT_MIN and len(drums_locked) < len(DRUM_NAMES):
-            cur = np.vstack(embeds_list)
-            for drum in DRUM_NAMES:
-                if drum not in drums_locked:
-                    if float((cur @ proto_matrices[drum].T).max()) >= EARLY_EXIT_THRESH:
-                        drums_locked.add(drum)
-            if len(drums_locked) == len(DRUM_NAMES):
-                log.info(f"  Early exit after {n_embedded}/{n_clips} clips — all drums locked")
-                break
 
     audio_embeds = np.vstack(embeds_list)
     log.info(f"  Embedded {n_embedded}/{n_clips} clips")
@@ -548,15 +526,11 @@ def run_drum_assignment(
 
         candidates_out = []
         for clip_idx in candidate_list:
-            ctx, trim_start, trim_end = build_context_clip(
-                audio, clip_starts[clip_idx], clip_ends[clip_idx]
-            )
+            ctx = clip_to_ctx_times(audio, clip_starts[clip_idx], clip_ends[clip_idx])
             candidates_out.append({
-                "audio":      clip_to_b64_wav(ctx),
-                "time":       round(times[clip_idx], 3),
-                "score":      round(float(scores[clip_idx, DRUM_NAMES.index(drum)]), 4),
-                "trim_start": trim_start,
-                "trim_end":   trim_end,
+                "time":  round(times[clip_idx], 3),
+                "score": round(float(scores[clip_idx, DRUM_NAMES.index(drum)]), 4),
+                **ctx,
             })
 
         drum_results[drum] = {"candidates": candidates_out}
@@ -593,15 +567,11 @@ def run_custom_text_queries(
             top_idx = np.argsort(sims)[::-1][:N_CANDIDATES]
             candidates_out = []
             for idx in top_idx:
-                ctx, trim_start, trim_end = build_context_clip(
-                    audio, clip_starts[int(idx)], clip_ends[int(idx)]
-                )
+                ctx = clip_to_ctx_times(audio, clip_starts[int(idx)], clip_ends[int(idx)])
                 candidates_out.append({
-                    "audio":      clip_to_b64_wav(ctx),
-                    "time":       round(float(times[int(idx)]), 3),
-                    "score":      round(float(sims[int(idx)]), 4),
-                    "trim_start": trim_start,
-                    "trim_end":   trim_end,
+                    "time":  round(float(times[int(idx)]), 3),
+                    "score": round(float(sims[int(idx)]), 4),
+                    **ctx,
                 })
             results[slot_id] = {"candidates": candidates_out}
             log.info(f"  {slot_id} ('{query_text}'): top score={float(sims[top_idx[0]]):.3f}")
@@ -614,57 +584,51 @@ def run_custom_text_queries(
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...), custom_texts: str = Form(default="{}")):
-    raw      = await file.read()
-    audio    = load_audio(raw)
+    import time as _t
+    t0 = _t.perf_counter()
+    raw   = await file.read()
+    audio = load_audio(raw)
     duration = len(audio) / SR
-    log.info(f"Audio: {duration:.1f}s")
-
-    if duration < 0.5:
-        raise HTTPException(400, "Audio too short (minimum 0.5 s)")
-    if duration > MAX_SECS:
-        raise HTTPException(400, f"Audio too long (maximum {MAX_SECS} s)")
-
+    t_load = _t.perf_counter()
+    log.info(f"Audio: {duration:.1f}s  load={t_load-t0:.2f}s")
+    if duration < 0.5: raise HTTPException(400, "Audio too short (minimum 0.5 s)")
+    if duration > MAX_SECS: raise HTTPException(400, f"Audio too long (maximum {MAX_SECS} s)")
     onsets = detect_onsets(audio)
-    log.info(f"Onsets: {len(onsets)}")
-    if len(onsets) == 0:
-        raise HTTPException(422, "No onsets detected")
-
+    t_onsets = _t.perf_counter()
+    log.info(f"Onsets: {len(onsets)}  onset_detect={t_onsets-t_load:.2f}s")
+    if len(onsets) == 0: raise HTTPException(422, "No onsets detected")
     embed_clips, output_clips, times, clip_starts, clip_ends = extract_clips(audio, onsets)
-
-    # Early exit is only safe when there are no custom CLAP text queries —
-    # those need full coverage to find the best match anywhere in the song.
     try:
         custom_dict = json.loads(custom_texts) if custom_texts else {}
     except json.JSONDecodeError:
         custom_dict = {}
-    can_early_exit = len(custom_dict) == 0
-
     audio_embeds, drum_results, n_embedded = run_drum_assignment(
-        audio, embed_clips, times, clip_starts, clip_ends, can_early_exit
+        audio, embed_clips, times, clip_starts, clip_ends
     )
-
-    # Trim session-bound lists to the portion that was actually embedded
-    output_clips = output_clips[:n_embedded]
-    times        = times[:n_embedded]
-    clip_starts  = clip_starts[:n_embedded]
-    clip_ends    = clip_ends[:n_embedded]
-
+    t_clap = _t.perf_counter()
+    log.info(f"CLAP done  clap={t_clap-t_onsets:.2f}s")
+    times       = times[:n_embedded]
+    clip_starts = clip_starts[:n_embedded]
+    clip_ends   = clip_ends[:n_embedded]
     custom_results = run_custom_text_queries(
         audio_embeds, clip_starts, clip_ends, times, audio, custom_dict
     )
     drum_results.update(custom_results)
+    sid = _new_session(audio_embeds, times, [], audio, clip_starts, clip_ends)
+    log.info(f"TOTAL={_t.perf_counter()-t0:.2f}s  (load={t_load-t0:.2f}  onsets={t_onsets-t_load:.2f}  clap={t_clap-t_onsets:.2f})")
+    return {"drums": drum_results, "onset_count": n_embedded, "session_id": sid}
 
-    log.info("Running Whisper...")
-    transcript = transcribe_audio(audio)
-    log.info(f"  Whisper: {len(transcript)} words")
-    if transcript:
-        lines = [f"    {w['start']:.2f}-{w['end']:.2f}  {w['word']}" for w in transcript]
-        log.info("  Transcript:\n" + "\n".join(lines))
 
-    sid = _new_session(audio_embeds, output_clips, times, transcript,
-                       audio, clip_starts, clip_ends)
-    return {"drums": drum_results, "onset_count": n_embedded,
-            "transcript": transcript, "session_id": sid}
+@app.post("/transcribe")
+async def transcribe_route(file: UploadFile = File(...)):
+    import time as _t
+    t0  = _t.perf_counter()
+    raw = await file.read()
+    audio = load_audio(raw)
+    log.info(f"Transcribe: {len(audio)/SR:.1f}s")
+    words = transcribe_audio(audio)
+    log.info(f"  {len(words)} words  whisper={_t.perf_counter()-t0:.2f}s")
+    return {"words": words}
 
 
 
@@ -744,7 +708,7 @@ async def query_custom(
         matches = [w for w in sess["transcript"] if w["word"] == needle]
         if not matches:
             matches = [w for w in sess["transcript"] if w["word"].startswith(needle)]
-        candidates = [{"audio": m["audio"], "time": m["start"], "score": 1.0}
+        candidates = [{"word": m["word"], "start": m["start"], "end": m["end"]}
                       for m in matches[:top_k]]
         log.info(f"  lyrics query '{needle}': {len(matches)} matches")
         return {"candidates": candidates, "mode": "lyrics", "matches": len(matches)}
@@ -757,11 +721,10 @@ async def query_custom(
             if sims.ndim == 0:
                 sims = sims.reshape(1)
             top_idx = np.argsort(sims)[::-1][:top_k]
-            candidates = [{
-                "audio": clip_to_b64_wav(sess["output_clips"][int(i)]),
-                "time":  round(float(sess["times"][int(i)]), 3),
-                "score": round(float(sims[int(i)]), 4),
-            } for i in top_idx]
+            candidates = []
+            for i in top_idx:
+                ctx = clip_to_ctx_times(sess["audio_raw"], sess["clip_starts"][int(i)], sess["clip_ends"][int(i)])
+                candidates.append({"time": round(float(sess["times"][int(i)]), 3), "score": round(float(sims[int(i)]), 4), **ctx})
             return {"candidates": candidates, "mode": "clap"}
         except Exception as e:
             raise HTTPException(500, f"CLAP query failed: {e}")

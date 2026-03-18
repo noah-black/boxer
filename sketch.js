@@ -73,6 +73,8 @@ let lyricsCheckEls  = [];   // 4 checkboxes, one per custom pad
 let lyricsTranscript = [];  // [{word, start, end, buffer}] decoded after analyze
 let padLyricsMode   = {};   // id -> bool
 let sessionId       = null; // server session token for live re-querying
+let sourceBuffer    = null;   // AudioBuffer decoded from the uploaded file
+let transcriptLoaded = false; // true once /transcribe returns
 
 // Transcript picker state
 let pickerOpen      = false;   // is the picker panel visible?
@@ -149,6 +151,7 @@ function setup() {
     cb.type = 'checkbox';
     cb.style.cssText = 'margin:0;cursor:pointer;width:11px;height:11px';
     cb.addEventListener('change', () => {
+      if(!transcriptLoaded){ cb.checked = false; return; }
       padLyricsMode[d.id] = cb.checked;
       if(cb.checked){
         if(lyricsTranscript.length > 0) openPicker(d.id, i);
@@ -428,8 +431,16 @@ function drawTrimBar(d, x, y, padW) {
 
   fill(...PANEL); stroke(...INK); strokeWeight(1); rect(tb.x, tb.y, tb.w, tb.h, 3);
   if(has && curCand){
-    const buf  = curCand.buffer;
-    const chan  = buf.getChannelData(0);
+    let chan;
+    if(curCand.buffer){
+      chan = curCand.buffer.getChannelData(0);
+    } else if(sourceBuffer){
+      const sr = sourceBuffer.sampleRate;
+      const s  = Math.max(0, Math.floor((curCand.ctxStart||0) * sr));
+      const e  = Math.min(sourceBuffer.length, Math.ceil((curCand.ctxEnd||1) * sr));
+      chan = sourceBuffer.getChannelData(0).subarray(s, e);
+    }
+    if(!chan){ return; }
     const step  = max(1, Math.floor(chan.length / tb.w));
     for(let pixelX=0; pixelX<tb.w; pixelX++){
       const frac      = pixelX / tb.w;
@@ -936,14 +947,31 @@ function scheduleLoop() {
   scheduleTimer=setTimeout(scheduleLoop,LOOKAHEAD_MS);
 }
 
+function _playCandidate(id, cand, when) {
+  const src = audioCtx.createBufferSource();
+  src.playbackRate.value = Math.pow(2, drumPitch[id]/12);
+  if(cand.buffer){
+    src.buffer = cand.buffer;
+    src.connect(gainNodes[id]);
+    const dur = cand.buffer.duration;
+    src.start(when, drumTrimStart[id]*dur, (drumTrimEnd[id]-drumTrimStart[id])*dur);
+  } else {
+    if(!sourceBuffer) return;
+    src.buffer = sourceBuffer;
+    const norm = audioCtx.createGain();
+    norm.gain.value = cand.normGain ?? 1.0;
+    src.connect(norm); norm.connect(gainNodes[id]);
+    const ctxDur = (cand.ctxEnd||1) - (cand.ctxStart||0);
+    const offset   = (cand.ctxStart||0) + drumTrimStart[id] * ctxDur;
+    const duration = (drumTrimEnd[id] - drumTrimStart[id]) * ctxDur;
+    src.start(when, offset, duration);
+  }
+}
+
 function triggerDrumAtTime(id, when) {
   const cands=drumCandidates[id]; if(!cands||!cands.length) return;
   const cand=cands[drumIdx[id]]; if(!cand) return;
-  const src=audioCtx.createBufferSource();
-  src.buffer=cand.buffer; src.connect(gainNodes[id]);
-  const dur=cand.buffer.duration;
-  src.playbackRate.value = Math.pow(2, drumPitch[id]/12);
-  src.start(when,drumTrimStart[id]*dur,(drumTrimEnd[id]-drumTrimStart[id])*dur);
+  _playCandidate(id, cand, when);
 }
 
 function scheduleMetronomeClick(when, isDownbeat) {
@@ -1230,64 +1258,68 @@ function onFileSelected()  { const f=uploadEl.elt.files[0]; if(f) submitAudio(f)
 async function submitAudio(blob) {
   if(!blob) return;
   setPhase('processing');
-  const form=new FormData();
+
+  // Decode source audio for client-side clip extraction
+  const arrayBuf = await blob.arrayBuffer();
+  sourceBuffer = await audioCtx.decodeAudioData(arrayBuf.slice(0));
+
+  // Gray out lyrics checkboxes until transcript arrives
+  transcriptLoaded = false;
+  lyricsCheckEls.forEach(el => { el._cb.disabled = true; el.style.opacity = '0.4'; });
+  lyricsTranscript = [];
+
+  // Fire /transcribe in background (parallel with /analyze)
+  const transcribeForm = new FormData();
+  transcribeForm.append('file', blob, 'audio');
+  fetch(`${BACKEND}/transcribe`, {method:'POST', body:transcribeForm})
+    .then(r => r.ok ? r.json() : null)
+    .then(data => {
+      if(!data) return;
+      lyricsTranscript = data.words || [];
+      transcriptLoaded = true;
+      lyricsCheckEls.forEach(el => { el._cb.disabled = false; el.style.opacity = ''; });
+      CUSTOM_DRUMS.forEach((d, i) => { if(padLyricsMode[d.id]) applyLyricsQuery(d.id, i); });
+    })
+    .catch(e => console.warn('[transcribe] failed:', e));
+
+  // Fire /analyze (await this one)
+  const form = new FormData();
   form.append('file', blob, 'audio');
-  const customTexts={};
-  CUSTOM_DRUMS.forEach((d,i)=>{
-    const v=customInputEls[i].value().trim();
-    if(v) customTexts[d.id]=v;
+  const customTexts = {};
+  CUSTOM_DRUMS.forEach((d, i) => {
+    const v = customInputEls[i].value().trim();
+    if(v) customTexts[d.id] = v;
   });
   form.append('custom_texts', JSON.stringify(customTexts));
+
   let data;
   try {
-    const resp=await fetch(`${BACKEND}/analyze`,{method:'POST',body:form});
-    if(!resp.ok){const e=await resp.json().catch(()=>({detail:resp.statusText}));throw new Error(e.detail||resp.statusText);}
-    data=await resp.json();
+    const resp = await fetch(`${BACKEND}/analyze`, {method:'POST', body:form});
+    if(!resp.ok){ const e=await resp.json().catch(()=>({detail:resp.statusText})); throw new Error(e.detail||resp.statusText); }
+    data = await resp.json();
   } catch(e){ errorMsg=e.message; setPhase('error'); return; }
-  // Store session token for live re-querying
+
   sessionId = data.session_id || null;
 
-  ALL_DRUMS.forEach(d=>{
-    drumCandidates[d.id]=[]; drumIdx[d.id]=0;
-    drumTrimStart[d.id]=0; drumTrimEnd[d.id]=1;
+  ALL_DRUMS.forEach(d => {
+    drumCandidates[d.id] = []; drumIdx[d.id] = 0;
+    drumTrimStart[d.id] = 0; drumTrimEnd[d.id] = 1;
   });
-  for(const [id,info] of Object.entries(data.drums)){
-    const decoded=[];
-    for(const cand of info.candidates){
-      try{
-        const bin=atob(cand.audio), bytes=new Uint8Array(bin.length);
-        for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
-        const buf=await audioCtx.decodeAudioData(bytes.buffer.slice(0));
-        decoded.push({buffer:buf,score:cand.score,time:cand.time,
-               trimStart:cand.trim_start??0, trimEnd:cand.trim_end??1});
-      } catch(e){ console.warn(`decode ${id}:`,e); }
-    }
-    drumCandidates[id]=decoded;
-    // Initialise trim handles from the first candidate's context window
-    if(decoded.length > 0){
-      drumTrimStart[id] = decoded[0].trimStart;
-      drumTrimEnd[id]   = decoded[0].trimEnd;
+  for(const [id, info] of Object.entries(data.drums)){
+    drumCandidates[id] = info.candidates.map(c => ({
+      ctxStart:  c.ctx_start_s,
+      ctxEnd:    c.ctx_end_s,
+      trimStart: c.trim_start ?? 0,
+      trimEnd:   c.trim_end   ?? 1,
+      normGain:  c.norm_gain  ?? 1.0,
+      score:     c.score,
+      time:      c.time,
+    }));
+    if(drumCandidates[id].length > 0){
+      drumTrimStart[id] = drumCandidates[id][0].trimStart;
+      drumTrimEnd[id]   = drumCandidates[id][0].trimEnd;
     }
   }
-
-  // Decode transcript audio buffers for lyrics mode
-  console.log('[analyze] transcript words from server:', (data.transcript||[]).length);
-  lyricsTranscript = [];
-  for(const w of (data.transcript || [])){
-    try{
-      const bin=atob(w.audio), bytes=new Uint8Array(bin.length);
-      for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
-      const buf=await audioCtx.decodeAudioData(bytes.buffer.slice(0));
-      lyricsTranscript.push({word:w.word, start:w.start, end:w.end, buffer:buf,
-               rawEndSamps: w.raw_end_samps ?? buf.length});
-    } catch(e){ console.warn('transcript decode:', e); }
-  }
-
-  console.log('[analyze] lyricsTranscript decoded:', lyricsTranscript.length, 'sessionId:', sessionId);
-  // Re-apply lyrics queries for any pads in lyrics mode
-  CUSTOM_DRUMS.forEach((d,i) => {
-    if(padLyricsMode[d.id]) applyLyricsQuery(d.id, i);
-  });
 
   setPhase('ready');
 }
@@ -1422,30 +1454,19 @@ function renderPickerChips() {
 
 async function commitPickerSelection() {
   if(pickerSel.length === 0 || pickerPadId === null) return;
-  // Sort selection and merge buffers
-  const sorted  = [...pickerSel].sort((a,b)=>a-b);
-  const words   = sorted.map(i => lyricsTranscript[i]);
-  const merged  = await mergeWordBuffers(words);
+  const sorted = [...pickerSel].sort((a,b)=>a-b);
+  const words  = sorted.map(i => lyricsTranscript[i]);
+  const merged = mergeWordBuffers(words);
   if(!merged) return;
-
-  const cand = {
-    buffer:     merged,
-    score:      1.0,
-    time:       words[0].start,
-    trimStart:  0,
-    trimEnd:    1,
-  };
+  const cand = { buffer: merged, score: 1.0, time: words[0].start, trimStart: 0, trimEnd: 1 };
   drumCandidates[pickerPadId] = [cand];
   drumIdx[pickerPadId]        = 0;
   drumTrimStart[pickerPadId]  = 0;
   drumTrimEnd[pickerPadId]    = 1;
   padFlash[pickerPadId]       = millis();
   triggerDrum(pickerPadId);
-
-  // Populate the text field with the selected words
   const text = words.map(w=>w.word).join(' ');
   if(customInputEls[pickerPadCustomIdx]) customInputEls[pickerPadCustomIdx].elt.value = text;
-
   closePicker();
 }
 
@@ -1468,20 +1489,20 @@ function queryClapLive(id, customIdx) {
       const resp = await fetch(`${BACKEND}/query-custom`, {method:'POST', body:form});
       if(!resp.ok) return;
       const data = await resp.json();
-      const decoded = [];
-      for(const cand of data.candidates){
-        try{
-          const bin=atob(cand.audio), bytes=new Uint8Array(bin.length);
-          for(let k=0;k<bin.length;k++) bytes[k]=bin.charCodeAt(k);
-          const buf=await audioCtx.decodeAudioData(bytes.buffer.slice(0));
-          decoded.push({buffer:buf, score:cand.score, time:cand.time});
-        } catch(e){}
-      }
+      const decoded = data.candidates.map(c => ({
+        ctxStart:  c.ctx_start_s,
+        ctxEnd:    c.ctx_end_s,
+        trimStart: c.trim_start ?? 0,
+        trimEnd:   c.trim_end   ?? 1,
+        normGain:  c.norm_gain  ?? 1.0,
+        score:     c.score,
+        time:      c.time,
+      }));
       if(decoded.length > 0){
         drumCandidates[id] = decoded;
         drumIdx[id] = 0;
-        drumTrimStart[id] = 0;
-        drumTrimEnd[id] = 1;
+        drumTrimStart[id] = decoded[0].trimStart;
+        drumTrimEnd[id]   = decoded[0].trimEnd;
         padFlash[id] = millis();
       }
     } catch(e){ console.warn('CLAP live query failed:', e); }
@@ -1490,28 +1511,28 @@ function queryClapLive(id, customIdx) {
 
 // ── Lyrics query ─────────────────────────────────────────────────────────────
 
-// Merge consecutive transcript word objects into one AudioBuffer.
-// All words except the last are trimmed to their raw (pre-post-roll) length
-// so the 200ms tail of word[i] doesn't overlap with word[i+1]'s start.
-async function mergeWordBuffers(words) {
-  if(words.length === 0) return null;
-  if(words.length === 1) return words[0].buffer;
-  const sr = words[0].buffer.sampleRate;
-  // Compute trimmed lengths: raw for all but last, full for last
-  const lens = words.map((w, i) =>
-    i < words.length-1
-      ? Math.min(w.rawEndSamps ?? w.buffer.length, w.buffer.length)
-      : w.buffer.length
-  );
-  const total = lens.reduce((a,b)=>a+b, 0);
-  const out   = audioCtx.createBuffer(1, total, sr);
-  const ch    = out.getChannelData(0);
-  let pos = 0;
-  words.forEach((w, i) => {
-    const src = w.buffer.getChannelData(0);
-    ch.set(src.subarray(0, lens[i]), pos);
-    pos += lens[i];
+// Merge consecutive transcript words into one AudioBuffer by slicing sourceBuffer.
+// Non-last words use raw end (no post-roll); last word adds LYRIC_POST_ROLL.
+const LYRIC_POST_ROLL = 0.20;
+function mergeWordBuffers(words) {
+  if(!sourceBuffer || words.length === 0) return null;
+  const sr = sourceBuffer.sampleRate;
+  const srcData = sourceBuffer.getChannelData(0);
+  // Compute sample ranges
+  const ranges = words.map((w, i) => {
+    const s = Math.max(0, Math.round(w.start * sr));
+    const rawE = Math.min(sourceBuffer.length, Math.round(w.end * sr));
+    const padE = i === words.length-1
+      ? Math.min(sourceBuffer.length, Math.round((w.end + LYRIC_POST_ROLL) * sr))
+      : rawE;
+    return {s, e: padE, len: padE - s};
   });
+  const total = ranges.reduce((a, r) => a + r.len, 0);
+  if(total <= 0) return null;
+  const out = audioCtx.createBuffer(1, total, sr);
+  const ch  = out.getChannelData(0);
+  let pos = 0;
+  ranges.forEach(r => { ch.set(srcData.subarray(r.s, r.e), pos); pos += r.len; });
   return out;
 }
 
@@ -1520,29 +1541,7 @@ function applyLyricsQuery(id, customIdx) {
   const query = raw.toLowerCase().replace(/[.,!?;:'"()\-\u2014\u2013]/g,'').trim();
   if(!query){ drumCandidates[id]=[]; drumIdx[id]=0; return; }
 
-  if(lyricsTranscript.length === 0){
-    if(!sessionId) return;
-    // No local transcript yet — fall back to server
-    (async()=>{
-      try{
-        const form=new FormData();
-        form.append('session_id',sessionId); form.append('text',query);
-        form.append('mode','lyrics'); form.append('top_k','3');
-        const resp=await fetch(`${BACKEND}/query-custom`,{method:'POST',body:form});
-        const data=await resp.json();
-        const decoded=[];
-        for(const c of (data.candidates||[])){
-          const bin=atob(c.audio),bytes=new Uint8Array(bin.length);
-          for(let k=0;k<bin.length;k++) bytes[k]=bin.charCodeAt(k);
-          const buf=await audioCtx.decodeAudioData(bytes.buffer.slice(0));
-          decoded.push({buffer:buf,score:1.0,time:c.time,trimStart:c.trim_start??0,trimEnd:c.trim_end??1});
-        }
-        drumCandidates[id]=decoded; drumIdx[id]=0;
-        if(decoded.length>0){ drumTrimStart[id]=decoded[0].trimStart; drumTrimEnd[id]=decoded[0].trimEnd; padFlash[id]=millis(); }
-      }catch(e){ console.error('[lyrics] server query failed:',e); }
-    })();
-    return;
-  }
+  if(lyricsTranscript.length === 0){ drumCandidates[id]=[]; drumIdx[id]=0; return; }
 
   // Local search — support multi-word sequences
   const tokens = query.split(/\s+/).filter(Boolean);
@@ -1559,16 +1558,14 @@ function applyLyricsQuery(id, customIdx) {
   }
 
   const candidates = hits.slice(0, N_CANDIDATES);
-  (async()=>{
-    const decoded=[];
-    for(const hit of candidates){
-      const buf = await mergeWordBuffers(hit.words);
-      if(buf) decoded.push({buffer:buf,score:1.0,time:hit.start,trimStart:0,trimEnd:1});
-    }
-    drumCandidates[id]=decoded; drumIdx[id]=0;
-    drumTrimStart[id]=0; drumTrimEnd[id]=1;
-    if(decoded.length>0) padFlash[id]=millis();
-  })();
+  const decoded = [];
+  for(const hit of candidates){
+    const buf = mergeWordBuffers(hit.words);
+    if(buf) decoded.push({buffer:buf, score:1.0, time:hit.start, trimStart:0, trimEnd:1});
+  }
+  drumCandidates[id] = decoded; drumIdx[id] = 0;
+  drumTrimStart[id] = 0; drumTrimEnd[id] = 1;
+  if(decoded.length > 0) padFlash[id] = millis();
 }
 
 // ── Playback ──────────────────────────────────────────────────────────────────
@@ -1577,10 +1574,6 @@ function triggerDrum(id) {
   const cands=drumCandidates[id]; if(!cands||!cands.length) return;
   const cand=cands[drumIdx[id]]; if(!cand) return;
   if(audioCtx.state==='suspended') audioCtx.resume();
-  const src=audioCtx.createBufferSource();
-  src.buffer=cand.buffer; src.connect(gainNodes[id]);
-  const dur=cand.buffer.duration;
-  src.playbackRate.value = Math.pow(2, drumPitch[id]/12);
-  src.start(0,drumTrimStart[id]*dur,(drumTrimEnd[id]-drumTrimStart[id])*dur);
+  _playCandidate(id, cand, 0);
   padFlash[id]=millis();
 }

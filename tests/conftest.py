@@ -46,6 +46,7 @@ def _fake_processor_call(audio=None, text=None, sampling_rate=None,
 
 _fake_model = MagicMock()
 _fake_model.eval.return_value = _fake_model
+_fake_model.to.return_value   = _fake_model   # .to(device) must return self
 _fake_model.audio_model.side_effect = lambda **kw: _FakeModelOutput(_batch_size_from_kwargs(kw))
 _fake_model.text_model.side_effect  = lambda **kw: _FakeModelOutput(_batch_size_from_kwargs(kw))
 _fake_model.audio_projection.side_effect = lambda x: x   # identity; x is a real torch.Tensor

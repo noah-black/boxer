@@ -26,19 +26,29 @@ matches.
 ```
 boxer/
   backend/
-    main.py          — FastAPI backend, all processing logic (~730 lines)
-    vocabulary.py    — 259-term noun vocabulary for custom pad labelling
-    requirements.txt
-    references/      — reference audio for drum prototypes (NOT in repo, user provides)
-      kick/
-        studio/      — one subfolder per style, each containing .wav files
-        beatbox/
-      snare/...
-      hihat/...
-      clap/...
-  frontend/
-    index.html       — minimal shell, loads p5.js and defines 4 custom-input fields
-    sketch.js        — entire frontend (~1550 lines, p5.js)
+    __init__.py      — package marker
+    constants.py     — all shared constants (SR, clip params, model IDs, paths)
+    models.py        — CLAP/Whisper loading, embedding helpers, prototypes, vocabulary
+    dsp.py           — audio I/O, onset detection, clip extraction, context windowing
+    analysis.py      — drum assignment, custom text queries, candidate building
+    app.py           — FastAPI app, CORS, routes, session cache, static serving
+  main.py            — thin shim: re-exports for `uvicorn main:app` and test compat
+  vocabulary.py      — 259-term noun vocabulary for custom pad labelling
+  requirements.txt
+  references/        — reference audio for drum prototypes (NOT in repo, user provides)
+    kick/
+      studio/        — one subfolder per style, each containing .wav files
+      beatbox/
+    snare/...
+    hihat/...
+    clap/...
+  index.html         — HTML shell, loads p5.js and 5 frontend script files
+  config.js          — constants, palette, DRUMS/CUSTOM_DEFS, createSlot(), utilities
+  state.js           — global mutable state, slot/pad CRUD, keyboard map
+  render.js          — all drawing: header, pads, sequencer, overlays, layout
+  audio.js           — scheduler, drum triggering, recording, CLAP queries, lyrics
+  input.js           — p5 lifecycle, mouse/keyboard handlers, transcript picker
+  sketch.js          — (legacy single-file version, superseded by the 5 files above)
   CLAUDE.md          — this file
   README.md
   boxer-blog.md      — technical write-up of the classification approach

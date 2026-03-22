@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>BOXER</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Silkscreen:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; overflow: hidden; background: #EDE8DF; }
+    html { height: 100%; background: #EDE8DF; }
+    body { min-width: 700px; height: 100%; overflow-x: auto; overflow-y: hidden; background: #EDE8DF; }
     canvas { display: block; }
     #upload-input { display: none; }
 
@@ -27,17 +29,17 @@
       padding: 2px 4px;
       pointer-events: auto;
     }
-    .custom-input::placeholder { color: rgba(0,0,0,0.25); font-style: italic; }
+    .custom-input::placeholder { color: rgba(0,0,0,0.45); font-style: italic; }
     .custom-input:focus { border-bottom-color: rgba(0,0,0,0.7); }
   </style>
 </head>
 <body>
   <input type="file" id="upload-input" accept="audio/*">
-  <input type="text" id="custom-0" class="custom-input" placeholder="describe a sound…">
-  <input type="text" id="custom-1" class="custom-input" placeholder="describe a sound…">
-  <input type="text" id="custom-2" class="custom-input" placeholder="describe a sound…">
-  <input type="text" id="custom-3" class="custom-input" placeholder="describe a sound…">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.3/p5.min.js"></script>
-  <script src="sketch.js"></script>
+  <script src="config.js?v=5"></script>
+  <script src="state.js?v=5"></script>
+  <script src="render.js?v=5"></script>
+  <script src="audio.js?v=5"></script>
+  <script src="input.js?v=5"></script>
 </body>
 </html>

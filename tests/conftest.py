@@ -1,10 +1,10 @@
 """
-Stubs out the CLAP model before main.py is imported so that:
+Stubs out the CLAP model before backend.models is imported so that:
   - DSP unit tests load in <1 s (no model download or GPU warm-up)
   - Route tests run fast (embed calls return random unit vectors)
 
 The sys.modules patches at module level take effect during pytest collection,
-before any test file does `import main`.
+before any test file does `import main` or `import backend.models`.
 """
 
 import sys
@@ -14,10 +14,10 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 
-# ── Make main.py importable from the repo root ────────────────────────────────
+# ── Make main.py and backend/ importable from the repo root ──────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ── Fake CLAP model / processor ───────────────────────────────────────────────
+# ── Fake CLAP model / processor ─────────────────────────────────────────────
 
 _D = 512  # CLAP embedding dimension
 
@@ -39,7 +39,7 @@ def _batch_size_from_kwargs(kw: dict) -> int:
 
 def _fake_processor_call(audio=None, text=None, sampling_rate=None,
                           return_tensors=None, padding=None, **kw):
-    """Return a plain dict so **inputs unpacking works in _embed_batch."""
+    """Return a plain dict so **inputs unpacking works in embed_audio_batch."""
     n = len(audio) if audio is not None else len(text)
     return {"placeholder": torch.zeros(n, 1)}
 

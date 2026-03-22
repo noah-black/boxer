@@ -58,7 +58,7 @@ class TestRealClapIntegration:
 
         embed_clips, output_clips, times, clip_starts, clip_ends = extract_clips(audio, onsets)
         audio_embeds, drum_results, n_embedded = run_drum_assignment(
-            audio, embed_clips, times, clip_starts, clip_ends, can_early_exit=True
+            audio, embed_clips, times, clip_starts, clip_ends
         )
 
         # All four drum slots should be filled

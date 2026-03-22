@@ -3,7 +3,7 @@ Route tests with mocked ML models.
 
 - load_audio is mocked to return synthetic numpy audio (no ffmpeg dependency).
 - transcribe_audio is mocked to return an empty transcript (no Whisper).
-- _embed_batch uses the fake CLAP model from conftest.py (fast, no GPU).
+- embed_audio_batch uses the fake CLAP model from conftest.py (fast, no GPU).
 
 These tests catch endpoint signature bugs, JSON structure bugs, and session
 handling issues without any ML overhead.
@@ -20,6 +20,9 @@ from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 
 import main
+import backend.app as _app_mod
+import backend.dsp as _dsp_mod
+import backend.models as _models_mod
 from main import app, SR
 
 client = TestClient(app, raise_server_exceptions=True)
@@ -50,7 +53,7 @@ def _audio_to_wav_bytes(audio: np.ndarray) -> bytes:
 def _post_analyze(audio: np.ndarray, custom_texts: dict = None):
     """POST /analyze with mock load_audio bypassing ffmpeg."""
     wav = _audio_to_wav_bytes(audio)
-    with patch.object(main, "load_audio", return_value=audio):
+    with patch.object(_app_mod, "load_audio", return_value=audio):
         data = {}
         if custom_texts:
             data["custom_texts"] = json.dumps(custom_texts)
@@ -60,8 +63,8 @@ def _post_analyze(audio: np.ndarray, custom_texts: dict = None):
 def _post_transcribe(audio: np.ndarray):
     """POST /transcribe with mock load_audio bypassing ffmpeg."""
     wav = _audio_to_wav_bytes(audio)
-    with patch.object(main, "load_audio", return_value=audio), \
-         patch.object(main, "transcribe_audio", return_value=[
+    with patch.object(_app_mod, "load_audio", return_value=audio), \
+         patch.object(_app_mod, "transcribe_audio", return_value=[
              {"word": "kick", "start": 0.1, "end": 0.3},
              {"word": "snare", "start": 0.5, "end": 0.7},
          ]):
@@ -113,7 +116,7 @@ class TestAnalyze:
     def test_candidate_ctx_times_in_range(self):
         audio = _make_audio()
         resp  = _post_analyze(audio)
-        duration = len(audio) / main.SR
+        duration = len(audio) / SR
         for slot_id, info in resp.json()["drums"].items():
             for c in info["candidates"]:
                 assert c["ctx_start_s"] >= 0.0
@@ -124,12 +127,12 @@ class TestAnalyze:
         audio = _make_audio()
         resp  = _post_analyze(audio)
         sid   = resp.json()["session_id"]
-        assert sid in main._sessions
+        assert sid in _app_mod._sessions
 
     def test_too_short_returns_400(self):
         # 0.2 s — below the 0.5 s minimum
         audio = np.zeros(int(0.2 * SR), dtype=np.float32)
-        with patch.object(main, "load_audio", return_value=audio):
+        with patch.object(_app_mod, "load_audio", return_value=audio):
             resp = client.post("/analyze",
                                files={"file": ("a.wav", b"x", "audio/wav")})
         assert resp.status_code == 400
@@ -137,7 +140,7 @@ class TestAnalyze:
     def test_no_onsets_returns_422(self):
         # Pure silence — no transients
         audio = np.zeros(int(1.5 * SR), dtype=np.float32)
-        with patch.object(main, "load_audio", return_value=audio):
+        with patch.object(_app_mod, "load_audio", return_value=audio):
             resp = client.post("/analyze",
                                files={"file": ("a.wav", b"x", "audio/wav")})
         assert resp.status_code == 422
@@ -162,10 +165,9 @@ class TestAnalyze:
 
     def test_malformed_custom_texts_still_returns_200(self):
         # An invalid JSON string in custom_texts shouldn't crash the server.
-        # (json.loads raises — route should handle or default to {})
         audio = _make_audio()
         wav   = _audio_to_wav_bytes(audio)
-        with patch.object(main, "load_audio", return_value=audio):
+        with patch.object(_app_mod, "load_audio", return_value=audio):
             resp = client.post("/analyze",
                                files={"file": ("a.wav", wav, "audio/wav")},
                                data={"custom_texts": "{bad json"})
@@ -185,7 +187,7 @@ class TestRecordCustom:
     def test_happy_path_response_structure(self):
         audio = _make_audio(duration_s=0.5, onset_times_s=[0.1])
         wav   = _audio_to_wav_bytes(audio)
-        with patch.object(main, "load_audio", return_value=audio):
+        with patch.object(_app_mod, "load_audio", return_value=audio):
             resp = client.post("/record-custom",
                                files={"file": ("rec.wav", wav, "audio/wav")},
                                data={"slot_id": "custom_2"})
@@ -199,7 +201,7 @@ class TestRecordCustom:
     def test_labels_have_term_and_score(self):
         audio = _make_audio(duration_s=0.5, onset_times_s=[0.1])
         wav   = _audio_to_wav_bytes(audio)
-        with patch.object(main, "load_audio", return_value=audio):
+        with patch.object(_app_mod, "load_audio", return_value=audio):
             resp = client.post("/record-custom",
                                files={"file": ("rec.wav", wav, "audio/wav")},
                                data={"slot_id": "custom_0", "top_k": "3"})
@@ -212,7 +214,7 @@ class TestRecordCustom:
     def test_default_top_k_is_five(self):
         audio = _make_audio(duration_s=0.5, onset_times_s=[0.1])
         wav   = _audio_to_wav_bytes(audio)
-        with patch.object(main, "load_audio", return_value=audio):
+        with patch.object(_app_mod, "load_audio", return_value=audio):
             resp = client.post("/record-custom",
                                files={"file": ("rec.wav", wav, "audio/wav")},
                                data={"slot_id": "custom_1"})
@@ -229,7 +231,7 @@ class TestQueryCustom:
         D     = 512
         sid   = str(uuid.uuid4())
         audio = _make_audio()
-        main._sessions[sid] = {
+        _app_mod._sessions[sid] = {
             "audio_embeds": np.random.randn(n_clips, D).astype(np.float32),
             "times":        [i * 0.3 for i in range(n_clips)],
             "transcript": [
@@ -335,8 +337,8 @@ class TestTranscribe:
     def test_transcribe_empty_audio_returns_empty_words(self):
         audio = _make_audio()
         wav   = _audio_to_wav_bytes(audio)
-        with patch.object(main, "load_audio", return_value=audio), \
-             patch.object(main, "transcribe_audio", return_value=[]):
+        with patch.object(_app_mod, "load_audio", return_value=audio), \
+             patch.object(_app_mod, "transcribe_audio", return_value=[]):
             resp = client.post("/transcribe", files={"file": ("audio.wav", wav, "audio/wav")})
         assert resp.status_code == 200
         assert resp.json()["words"] == []

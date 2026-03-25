@@ -15,7 +15,7 @@ audio (drums, beatboxing, found sounds, entire songs), the backend runs onset
 detection and CLAP embedding to classify and extract clips, and the frontend gives
 them a pad-based sampler with a polymetric step sequencer.
 
-It also supports lyrics mode: Whisper transcribes speech/sung audio, and custom pads
+It also supports lyrics mode: Whisper transcribes speech/sung audio, and pads
 can be assigned to specific words or phrases from the transcript rather than acoustic
 matches.
 
@@ -43,12 +43,11 @@ boxer/
     hihat/...
     clap/...
   index.html         — HTML shell, loads p5.js and 5 frontend script files
-  config.js          — constants, palette, DRUMS/CUSTOM_DEFS, createSlot(), utilities
+  config.js          — constants, palette, PAD_DEFS, createSlot(), utilities
   state.js           — global mutable state, slot/pad CRUD, keyboard map
   render.js          — all drawing: header, pads, sequencer, overlays, layout
   audio.js           — scheduler, drum triggering, recording, CLAP queries, lyrics
   input.js           — p5 lifecycle, mouse/keyboard handlers, transcript picker
-  sketch.js          — (legacy single-file version, superseded by the 5 files above)
   CLAUDE.md          — this file
   README.md
   boxer-blog.md      — technical write-up of the classification approach
@@ -89,7 +88,7 @@ session stores:
 - `ts` — last access time (TTL eviction at 30 min)
 
 The session enables `/query-custom` to re-query without re-uploading, which powers
-live re-querying as the user edits custom pad text fields.
+live re-querying as the user edits pad text fields.
 
 ### Key constants
 
@@ -165,9 +164,11 @@ replaced with zero vectors. They score 0 against everything and can't pollute sc
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/analyze` | POST | Main pipeline: audio → drum candidates + transcript + session |
-| `/record-custom` | POST | Record a single sound into a custom pad, label via vocab |
-| `/query-custom` | POST | Re-query a custom pad against session data (CLAP or lyrics) |
+| `/analyze` | POST | Main pipeline: audio → drum candidates + session |
+| `/transcribe` | POST | Whisper transcription of uploaded audio |
+| `/record-custom` | POST | Record a single sound into a pad, label via vocab |
+| `/query-custom` | POST | Re-query a pad against session data (CLAP or lyrics) |
+| `/prototypes` | GET | List available drum prototype names |
 
 `/analyze` accepts `file` (audio blob) and `custom_texts` (JSON dict of slot_id →
 text for CLAP text-query matching).
@@ -181,43 +182,89 @@ text for CLAP text-query matching).
 ### Technology
 
 p5.js for canvas rendering + Web Audio API for playback. All UI is drawn on a single
-canvas except for HTML elements: 4 `<input type="text">` for custom pad descriptions,
-4 `<label>/<input type="checkbox">` for lyrics mode toggles, one `<input type="number">`
-for the add-grid step count, and a DOM div for the transcript picker modal.
+canvas except for HTML elements: one `<input type="text">` per active pad (for
+descriptions), and a DOM div for the transcript picker modal.
 
-The `drag` global handles all click-drag interactions (BPM slider, trim handles,
-volume/pitch dials, sequencer paint stroke).
+The `drag` global handles all click-drag interactions: BPM slider, trim handles,
+volume/pitch dials, sequencer paint stroke, pad reorder, slot reorder, measure
+reorder, and trim overlay drags.
 
-### Pad types
+### Pads (uniform — no standard/custom distinction)
 
-**Standard pads** (A S D F — kick, hi-hat, snare, clap): assigned by CLAP prototype
-matching from the full recording. Show waveform in trim bar, support trim widening.
+All pads are the same type. Up to 16 pads are available (`PAD_DEFS` in config.js).
+A new slot starts with zero pads; the user adds pads via the "+" button (which
+also shows prototype shortcut chips for kick/snare/hihat/clap in a 2×2 grid)
+after uploading audio.
 
-**Custom pads** (G H J K): two modes —
-- *CLAP text mode*: type a description in the text field, gets matched against
-  audio embeddings from the session. Field updates trigger live re-queries (400ms
-  debounce, `/query-custom`).
-- *Lyrics mode*: checkbox enables this. Opens transcript picker modal if transcript
-  is loaded, otherwise does string-match against `lyricsTranscript`. Supports
-  multi-word phrases by tokenizing query and finding consecutive runs in transcript.
-  Per-pad record button (small dot in trim bar area) records a clip directly; labels
-  it via vocabulary nearest-neighbor, populates text field with top label.
+**Keyboard mapping is positional**: `rebuildKbdMap()` assigns keys A S D F G H J K
+Z X C V B N M comma by *position* in `activePadIds`, not by pad ID. Deleting a pad
+shifts all subsequent keys. `padDisplayKey(id)` returns the current key for a pad
+based on its index.
+
+**Pad reordering**: clicking and holding anywhere on a pad body that isn't a control
+(dial, text input, button, trim bar) initiates a drag. A 5px movement threshold
+distinguishes click (trigger drum) from drag (reorder). During drag, the original
+pad dims, a ghost follows the cursor, and an insertion line shows the target
+position. Keyboard keys shift automatically on reorder.
+
+Each pad gets its sound through one of three modes, selected via a hamburger menu:
+- **Prototype mode**: assigns a drum prototype (kick, snare, etc.) from the analysis
+  results. The pad's text field shows the prototype name, becomes read-only.
+- **Lyrics mode**: opens the transcript picker modal to select words from the Whisper
+  transcript. Supports multi-word phrases.
+- **Record mode**: records a clip directly from the microphone, labels it via
+  vocabulary nearest-neighbor.
+
+Each pad has: volume dial, pitch dial, trim bar with draggable handles, candidate
+swap button (↻), remove button (×), and clear/reinit button when finalized.
+
+### Upload/record flow (per-slot)
+
+Upload and record controls live in the **pad area**, not the header. Each slot has
+three visual states:
+
+1. **Empty** (`!slot.sourceBuffer && !slot.reuploadPending`): pad area shows two
+   large centered icons — a red record circle and an upload icon. Clicking either
+   triggers the standard recording or file-upload flow.
+2. **Analyzing** (`slot.analyzing`): pad area shows a spinner animation with
+   "analyzing..." text and the filename.
+3. **Loaded**: pad area shows active pads and a "+" button to add more.
+
+The `analyzing` flag is **per-slot** (not global), so switching slots during analysis
+shows the correct state for each.
+
+**Re-upload**: a small ↻ icon in the sequencer slot header (next to the filename)
+sets `slot.reuploadPending = true`, which shows the record/upload prompt without
+clearing the existing `sourceBuffer`. The sequencer keeps playing the old sounds.
+When new analysis completes, the buffer is seamlessly swapped and existing
+prototype-mode pads are re-populated from the new results.
+
+**Trimmer**: after recording or selecting a file, a trim overlay lets the user
+crop the audio before submitting for analysis.
 
 ### Sequencer
 
-4 grids by default (starts with 1; user adds more). Each grid is independently
-configurable (2–32 steps). All grids share the same loop duration (4 beats at BPM),
-so different step counts create polyrhythm. Single scanline across all grids.
+Slots (sequencers) start at 1; user adds more via "+" below the last slot. Each slot
+has its own grid (3–32 steps). All slots share the same loop duration (4 beats at
+BPM), so different step counts create polyrhythm. Single scanline across all grids.
+
+Each slot header shows: hamburger drag handle, measure tabs, filename (with ↻
+re-upload icon and animated spinner during analysis), RAND/SWING/VOL sliders,
+STEPS stepper, a C/D/S/M capsule, and a separate × remove button.
 
 **Scheduler** (critical — has been buggy, do not simplify): uses `setTimeout` loop
-every 25ms. `_nextSteps[gi]` runs up to `g.steps * 2` (not just `g.steps`) — this
-allows pre-scheduling step 0 of the next loop within the current lookahead window so
-the loop boundary is seamless. On rebase, subtract `g.steps` from each counter rather
-than resetting to 0, so pre-scheduled steps don't double-fire.
+every 25ms. `_nextSteps[slotIndex]` runs up to `grid.steps * 2` (not just
+`grid.steps`) — this allows pre-scheduling step 0 of the next loop within the
+current lookahead window so the loop boundary is seamless. On rebase, subtract
+`grid.steps` from each counter rather than resetting to 0, so pre-scheduled steps
+don't double-fire.
 
 `loopFraction()` uses `((pos % dur) + dur) % dur / dur` — the double-modulo is
 intentional, handles the brief negative `pos` that occurs when the scheduler
-advances `_loopStartTime` 100ms before the loop actually ends.
+advances `_loopStartTime` 100ms before the loop actually ends. An early-return
+guard `if (pos < 0) return 0;` prevents a scanline flash to the far right on
+sequencer start (when `_loopStartTime` is slightly in the future).
+`slotLoopFraction()` has the same guard.
 
 **Sequencer drag-paint**: clicking a cell starts a `seqPaint` drag. `mouseDragged`
 paints all cells between `lastS` and current step with the same on/off value as the
@@ -236,43 +283,55 @@ values.
 
 ### Transcript picker
 
-DOM modal, floated near the custom pad that opened it. Shows all Whisper words as
-chips. Click = select one word; shift-click = extend to contiguous range. "Use
-selection" calls `mergeWordBuffers` and assigns the merged clip to the pad.
+DOM modal, floated near the pad that opened it. Shows all Whisper words as flat
+white rectangular chips (no borders/rounded corners). Click = play a single word's
+audio preview. Drag across chips = select a contiguous range (visual only during
+drag; full merged selection plays on mouseup). "Use selection" calls
+`mergeWordBuffers` and assigns the merged clip to the pad.
 
 `mergeWordBuffers` trims each word except the last to `rawEndSamps` (stored from
 `raw_end_samps` in the server response) before concatenation. This removes the 200ms
 `LYRIC_POST_ROLL` tail from all but the final word, preventing an audible
 double-repetition at word boundaries.
 
+### Responsive layout
+
+`SEQ_MARGIN` is dynamic: both left and right margins shrink equally as the window
+narrows, from `SEQ_MARGIN_MAX` (56px) down to 8px. Below that, a horizontal
+scrollbar appears with content anchored to the left edge. The canvas minimum width is
+set by `MIN_WIDTH` in config.js.
+
+### .boxer file format (save/load)
+
+Sessions are saved as `.boxer` files — ZIP archives (via JSZip) containing:
+- `manifest.json` — version, BPM, slot configs, pad states, grid cells
+- `slots/N/source.wav` — source audio buffer for each slot
+- `pads/pad_N_slot_M.wav` — audio for record-mode pads
+
+Uses the File System Access API (`showSaveFilePicker`/`showOpenFilePicker`) for
+native save-as dialogs; falls back to `<a>.download` / `<input type="file">` on
+unsupported browsers.
+
+**Instant playback on load**: candidate metadata (`ctxStart`, `ctxEnd`, `trimStart`,
+`trimEnd`, `normGain`, `score`, `time`) is saved per-pad in the manifest. On load,
+candidates are restored before re-analysis begins, so all pads are playable
+immediately using `sourceBuffer` + saved offsets. Re-analysis runs in the background
+and refreshes candidates when done (a spinner shows in the sequencer handlebar
+during this time).
+
+**Transcript persistence**: Whisper transcripts are saved in the manifest to avoid
+non-deterministic re-transcription. Legacy files without saved transcripts fall
+back to re-running `/transcribe`.
+
+**CLAP queries during load**: `queryClapLive` waits (polls every 200ms) for analysis
+to finish if `slot.analyzing` is true, rather than silently failing when there's no
+session ID yet.
+
 ---
 
 ## Known fragile areas
 
-**1. The analyze route is too long (~200 lines).** It should be split into
-`run_drum_assignment()`, `run_custom_text_queries()`, and `build_session()` helper
-functions. Currently everything is inline.
-
-**2. Short variable names throughout.** `gi`, `di`, `ci`, `ri`, `si`, `ts`, `te`,
-`s` mean different things in different scopes. Rename pass needed.
-
-**3. `mousePressed` in sketch.js is ~150 lines** and handles everything from header
-clicks to pad trim handles to grid cells. Needs splitting by region.
-
-**4. drawPads is ~130 lines** and draws both standard and custom pads with shared
-but slightly divergent logic. Should be split into `drawStandardPad` and
-`drawCustomPad` calling shared helpers.
-
-**5. `seqGrid` and `grids` are parallel arrays** (`grids[i].steps`,
-`seqGrid[i][drumId]`). They should be a single array of objects:
-`grids[i] = { steps: 16, cells: { kick: [...], snare: [...], ... } }`.
-
-**6. HTML element positioning** (custom inputs, lyrics checkboxes, add-grid input,
-transcript picker) is computed every frame in `draw()` via `positionCustomInputs()`
-and `positionAddGridInput()`. This is fine for now but should move to
-`windowResized()` only.
-
-**7. `requirements.txt` has `torchaudio` listed** but it is no longer used (the
+**1. `requirements.txt` has `torchaudio` listed** but it is no longer used (the
 torchaudio-based Griffin-Lim transform route was removed). Safe to remove.
 
 ---
@@ -307,30 +366,35 @@ adjectives like "sudden", "gradual", "aggressive". Replaced with 259 concrete no
 only. Adjectives return unsatisfying labels; nouns match CLAP's training distribution
 better.
 
+**Standard vs custom pad distinction** — early versions had 4 fixed "standard" pads
+(kick/snare/hihat/clap, keys ASDF) auto-assigned by CLAP prototypes, and 4 "custom"
+pads (GHJK) with text input and lyrics mode. Replaced with a uniform pad system where
+all pads are identical and get their sound via a menu (prototype, lyrics, or record).
+
+**Eye icon / hiddenDrumIds** — pads could be hidden from the sequencer via an eye
+icon toggle. Removed because all pads are now elective (user adds/removes them
+explicitly), making hide/show redundant.
+
+**Upload/record in header** — originally the header had a record button, "upload file"
+text, and a loading pill. Moved to the pad area as a per-slot onboarding step for a
+cleaner header and more contextual upload flow.
+
 ---
 
 ## Planned work (priority order)
 
-### 1. Refactor (before anything else)
-
-- Rename short variables throughout both files
-- Split `analyze` route into helper functions
-- Split `mousePressed` and `drawPads` in sketch.js
-- Merge `grids` and `seqGrid` into one data structure
-- Move HTML element positioning out of `draw()` loop
-
-### 2. Tests
+### 1. Tests
 
 - **DSP unit tests** (high value, no GPU needed): synthesize test audio with impulses
   at known times, assert onset detection accuracy, clip boundary correctness,
   backtrack behavior. Use pytest, pure numpy, runs in <1s.
 - **Route tests with mocked models**: use pytest + httpx AsyncClient, mock
   `_embed_audio_arrays` and `transcribe_audio`. Catches endpoint signature bugs,
-  JSON structure bugs, the `custom = _json_peek` class of mistake.
+  JSON structure bugs.
 - **Integration tests** (slow, marked `@pytest.mark.slow`): real CLAP model, small
   reference audio, assert drum assignment scores above threshold.
 
-### 3. Modal deployment
+### 2. Modal deployment
 
 The backend needs to stay as a persistent process (session cache, loaded models).
 Modal's `@modal.web_endpoint` with `keep_warm=1` is the right pattern. Key
@@ -342,15 +406,12 @@ considerations:
 - Session cache works fine — Modal keeps the container warm between requests
 - References directory needs to be in the Modal volume or baked into the image
 
-### 4. Transcript picker improvements
+### 3. Transcript picker improvements
 
-- Currently shift-click only extends from anchor rightward/leftward. Should support
-  discontiguous selection (ctrl-click to add individual words).
+- Should support discontiguous selection (ctrl-click to add individual words).
 - No indication in the picker of which words are already assigned to other pads.
-- The picker doesn't reopen when lyrics checkbox is already checked and user wants
-  to reselect — need a "reopen picker" affordance.
 
-### 5. Whisper model upgrade
+### 4. Whisper model upgrade
 
 `WHISPER_MODEL = "base"` trades accuracy for speed. For whole-song transcription,
 `"small"` or `"medium"` gives meaningfully better word boundary accuracy, especially
@@ -360,20 +421,22 @@ for sung content. Should be a configurable parameter, not a constant.
 
 ## Product intent (aesthetic/UX notes)
 
-The tone of the whole tool is dry and utilitarian — think fine-tip pen drawing on
-cream paper, not a glossy DAW. The visual language: warm cream background (HSB
-38,14,93), white panels, thin 1px near-black borders, IBM Plex Mono throughout,
-Orbitron Bold only for the BOXER wordmark.
+The tone of the whole tool is dry and utilitarian — think fine-tip pen drawing,
+not a glossy DAW. The visual language: powder-blue-to-white vertical gradient
+background, white panels, thin 1px near-black borders, Silkscreen as the primary
+canvas font (IBM Plex Mono for HTML inputs/overlays), logo image for the BOXER
+wordmark.
 
 The user is a musician or sound designer who will use this to build unusual sample
 kits — recording a trash can, beatboxing, singing, or uploading a full song. The
-"custom pads" with CLAP text queries and lyrics mode are the most distinctive feature.
-The polymetric sequencer (multiple grids with different step counts sharing a loop
-duration) enables rhythm patterns that standard sequencers can't produce.
+pad menu system (prototype matching, CLAP text queries, lyrics mode) is the most
+distinctive feature. The polymetric sequencer (multiple slots with different step
+counts sharing a loop duration) enables rhythm patterns that standard sequencers
+can't produce.
 
 What the tool is *not*: it's not trying to be a DAW, not trying to be a drum machine
 with preset kits, not trying to be a speech-to-MIDI thing.
 
-The keyboard mapping is ASDF (standard pads) + GHJK (custom pads) — home row,
-intentional. The sequencer record mode only writes into grid 0 (16-step) regardless
-of how many grids exist, which is correct — the other grids are for manual programming.
+The keyboard mapping uses home row keys (A S D F G H J K, then Z X C V B N M comma).
+The sequencer record mode only writes into slot 0 (16-step) regardless of how many
+slots exist, which is correct — the other slots are for manual programming.

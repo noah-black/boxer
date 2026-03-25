@@ -224,6 +224,16 @@ async def query_custom(
             raise HTTPException(500, f"CLAP query failed: {exc}")
 
 
+@app.get("/prototypes")
+async def list_prototypes():
+    """Return the list of available drum prototype names (auto-detected from references/)."""
+    from backend.constants import REFERENCES_DIR
+    if not REFERENCES_DIR.exists():
+        return {"prototypes": []}
+    names = sorted(d.name for d in REFERENCES_DIR.iterdir() if d.is_dir())
+    return {"prototypes": names}
+
+
 # ── Serve frontend ────────────────────────────────────────────────────────────
 FRONTEND = pathlib.Path(__file__).resolve().parent.parent
 log.info(f"Serving frontend from: {FRONTEND}  (exists: {FRONTEND.exists()})")

@@ -7,7 +7,27 @@ function loopDuration() { return 4 * (60.0 / seqBPM); }
 function loopFraction() {
   if (!seqPlaying) return 0;
   const dur = loopDuration(), pos = audioCtx.currentTime - _loopStartTime;
+  if (pos < 0) return 0;
   return ((pos % dur) + dur) % dur / dur;
+}
+
+/** Per-slot loop fraction accounting for multiple measures.
+ *  Returns { measureIdx, fraction } where fraction is [0,1] within that measure. */
+function slotLoopFraction(slotIndex) {
+  if (!seqPlaying) return { measureIdx: 0, fraction: 0 };
+  const slot = slots[slotIndex], grid = slot.grid;
+  const nM = grid.measures.length;
+  const dur = loopDuration();
+  const pos = audioCtx.currentTime - _loopStartTime;
+  if (pos < 0) return { measureIdx: 0, fraction: 0 };
+  const fracInBase = ((pos % dur) + dur) % dur / dur;
+  // _measurePhase tracks which measure the current base loop corresponds to.
+  // fracInBase > ~0.95 and lookahead may have already pre-scheduled into next measure.
+  const phase = _measurePhase[slotIndex] || 0;
+  return {
+    measureIdx: phase % nM,
+    fraction: fracInBase,
+  };
 }
 
 // ── Swing/humanize step positions ────────────────────────────────────────────
@@ -46,6 +66,7 @@ function posToStep(pos, stepPositions) {
 function startSequencer() {
   if (audioCtx.state==='suspended') audioCtx.resume();
   _nextSteps=slots.map(()=>0);
+  _measurePhase=slots.map(()=>0);
   _loopStartTime=audioCtx.currentTime+0.05;
   seqPlaying=true; scheduleLoop();
 }
@@ -63,27 +84,37 @@ function scheduleLoop() {
     _loopStartTime+=loopDur;
     slots.forEach((slot,slotIndex) => {
       if (_nextSteps[slotIndex]!==undefined) _nextSteps[slotIndex]=Math.max(0,(_nextSteps[slotIndex]||0)-slot.grid.steps);
+      const nM=slot.grid.measures.length;
+      if (nM>1&&!globalMeasureLock) _measurePhase[slotIndex]=((_measurePhase[slotIndex]||0)+1)%nM;
       slot.humanizeSeeds=makeHumanizeSeeds();
     });
     if (seqRecording) scheduleMetronomeClick(_loopStartTime,true);
   }
+  const anySoloed=slots.some(s=>s.soloed);
   slots.forEach((slot,slotIndex) => {
     if (_nextSteps[slotIndex]===undefined) _nextSteps[slotIndex]=0;
+    const slotSilenced=slot.muted||(anySoloed&&!slot.soloed);
     const grid=slot.grid, stepDuration=loopDur/grid.steps;
+    const nM=grid.measures.length;
     const swingVal=slot.swing??0, humVal=slot.humanize??0;
     const seeds=slot.humanizeSeeds;
     while (_nextSteps[slotIndex]<grid.steps*2) {
-      const stepInLoop=_nextSteps[slotIndex]%grid.steps;
+      const stepInMeasure=_nextSteps[slotIndex]%grid.steps;
+      const baseLoopOffset=Math.floor(_nextSteps[slotIndex]/grid.steps); // 0 or 1 (lookahead)
+      const measureIdx=globalMeasureLock?(globalEditMeasure%nM):((_measurePhase[slotIndex]||0)+baseLoopOffset)%nM;
       const loopBase=_loopStartTime+Math.floor(_nextSteps[slotIndex]/grid.steps)*loopDur;
-      const seed=seeds?seeds[stepInLoop%seeds.length]:0;
+      const seed=seeds?seeds[stepInMeasure%seeds.length]:0;
       const humOffset=humVal>0?seed*humVal*stepDuration*0.3:0;
-      const time=loopBase+swingOffset(stepInLoop,stepDuration,swingVal)+humOffset;
+      const time=loopBase+swingOffset(stepInMeasure,stepDuration,swingVal)+humOffset;
       if (time>now+SCHEDULE_AHEAD) break;
-      getAllDrums(slot).forEach(drum => {
-        if (!slot.hiddenDrumIds.has(drum.id)&&grid.cells[drum.id]&&grid.cells[drum.id][stepInLoop])
-          triggerDrumAtTime(slot,drum.id,time);
-      });
-      if (slotIndex===0&&seqRecording&&stepInLoop%4===0&&stepInLoop>0)
+      if (!slotSilenced) {
+        const mCells=grid.measures[measureIdx].cells;
+        getActivePads(slot).forEach(drum => {
+          if (mCells[drum.id]&&mCells[drum.id][stepInMeasure])
+            triggerDrumAtTime(slot,drum.id,time);
+        });
+      }
+      if (slotIndex===0&&seqRecording&&stepInMeasure%4===0&&stepInMeasure>0)
         scheduleMetronomeClick(time,false);
       _nextSteps[slotIndex]++;
     }
@@ -142,8 +173,10 @@ function quantizeToGrid0(id) {
   const now=audioCtx.currentTime, loopDur=loopDuration();
   let pos=(now-_loopStartTime)%loopDur; if (pos<0) pos+=loopDur;
   const step=Math.round((pos/loopDur)*16)%16;
-  if (!slot.grid.cells[id]) slot.grid.cells[id]=new Array(slot.grid.steps).fill(false);
-  slot.grid.cells[id][step]=!slot.grid.cells[id][step];
+  const { measureIdx } = slotLoopFraction(0);
+  const mCells = slot.grid.measures[measureIdx].cells;
+  if (!mCells[id]) mCells[id]=new Array(slot.grid.steps).fill(false);
+  mCells[id][step]=!mCells[id][step];
 }
 
 // ── Trimmer helpers ──────────────────────────────────────────────────────────
@@ -244,7 +277,7 @@ async function submitAudio(blob) {
   slot.fileName = blob.name || 'mic recording';
   const arrayBuf=await blob.arrayBuffer();
   const newSourceBuffer=await audioCtx.decodeAudioData(arrayBuf.slice(0));
-  analyzing=true; slot.transcriptLoaded=false;
+  slot.analyzing=true; slot.transcriptLoaded=false;
   slot.lyricsTranscript=[];
 
   const transcribeForm=new FormData(); transcribeForm.append('file',blob,'audio');
@@ -253,13 +286,14 @@ async function submitAudio(blob) {
     .then(data=>{
       if (!data) return;
       slot.lyricsTranscript=data.words||[]; slot.transcriptLoaded=true;
-      slot.activePadIds.forEach((id,i)=>{if(slot.padLyricsMode[id])applyLyricsQuery(slot,id,i);});
+      slot.activePadIds.forEach(id=>{if(slot.padMode[id]==='lyrics')applyLyricsQuery(slot,id);});
     }).catch(e=>console.warn('[transcribe] failed:',e));
 
   const analyzeForm=new FormData(); analyzeForm.append('file',blob,'audio');
   const customTexts={};
-  slot.activePadIds.forEach((id,i)=>{
-    const val=slot.customInputEls[i]?slot.customInputEls[i].value().trim():'';
+  slot.activePadIds.forEach(id=>{
+    const el=slot.padInputEls[id];
+    const val=el?el.elt.value.trim():'';
     if(val) customTexts[id]=val;
   });
   analyzeForm.append('custom_texts',JSON.stringify(customTexts));
@@ -268,25 +302,25 @@ async function submitAudio(blob) {
     const resp=await fetch(`${BACKEND}/analyze`,{method:'POST',body:analyzeForm});
     if (!resp.ok) { const e=await resp.json().catch(()=>({detail:resp.statusText})); throw new Error(e.detail||resp.statusText); }
     data=await resp.json();
-  } catch(e) { analyzing=false; errorMsg=e.message; setPhase('error'); return; }
+  } catch(e) { slot.analyzing=false; errorMsg=e.message; setPhase('error'); return; }
 
-  slot.sourceBuffer=newSourceBuffer; slot.sessionId=data.session_id||null;
-  getAllDrums(slot).forEach(drum=>{
-    slot.drumCandidates[drum.id]=[]; slot.drumIdx[drum.id]=0;
-    slot.drumTrimStart[drum.id]=0; slot.drumTrimEnd[drum.id]=1;
-  });
-  for (const [id,info] of Object.entries(data.drums)) {
-    slot.drumCandidates[id]=info.candidates.map(c=>({
-      ctxStart:c.ctx_start_s, ctxEnd:c.ctx_end_s,
-      trimStart:c.trim_start??0, trimEnd:c.trim_end??1,
-      normGain:c.norm_gain??1.0, score:c.score, time:c.time,
-    }));
-    if (slot.drumCandidates[id].length>0) {
-      slot.drumTrimStart[id]=slot.drumCandidates[id][0].trimStart;
-      slot.drumTrimEnd[id]=slot.drumCandidates[id][0].trimEnd;
+  slot.sourceBuffer=newSourceBuffer; slot.sessionId=data.session_id||null; slot.reuploadPending=false;
+  slot.analyzeResults=data.drums||{};
+  // Re-populate existing pads from new results
+  slot.activePadIds.forEach(id=>{
+    slot.drumCandidates[id]=[]; slot.drumIdx[id]=0;
+    slot.drumTrimStart[id]=0; slot.drumTrimEnd[id]=1;
+    if (slot.padMode[id]==='prototype') {
+      const el=slot.padInputEls[id];
+      const protoName=el?el.elt.value.trim():'';
+      if (protoName && slot.analyzeResults[protoName]) {
+        applyPrototype(slot, id, protoName);
+      }
     }
-  }
-  analyzing=false; if (phase!=='ready') setPhase('ready');
+  });
+  slot.analyzing=false;
+  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+  if (phase!=='ready') setPhase('ready');
 }
 
 // ── Per-pad recording ────────────────────────────────────────────────────────
@@ -297,6 +331,11 @@ async function startPadRecording(id) {
   let stream;
   try { stream=await navigator.mediaDevices.getUserMedia({audio:true,video:false}); }
   catch(e) { errorMsg='Microphone access denied'; setPhase('error'); return; }
+  const src=audioCtx.createMediaStreamSource(stream);
+  padRecAnalyser=audioCtx.createAnalyser(); padRecAnalyser.fftSize=512;
+  padRecWaveformData=new Uint8Array(padRecAnalyser.frequencyBinCount);
+  src.connect(padRecAnalyser);
+  padRecordingId=id;
   const chunks=[], recorder=new MediaRecorder(stream);
   const recState={cancelled:false};
   recorder.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
@@ -317,6 +356,7 @@ function stopPadRecording(id) {
   clearTimeout(rec.limitTimer); rec.mediaRecorder.stop();
   rec.stream.getTracks().forEach(t=>t.stop());
   slot.padRecording[id]=false; slot.padRecorders[id]=null;
+  padRecAnalyser=null; padRecWaveformData=null; padRecordingId=null;
 }
 
 async function submitPadRecording(slot, id, blob) {
@@ -333,9 +373,11 @@ async function submitPadRecording(slot, id, blob) {
     slot.drumIdx[id]=0; slot.drumTrimStart[id]=0; slot.drumTrimEnd[id]=1;
     slot.padRecLabels[id]=data.labels;
     if (data.labels&&data.labels.length>0) {
-      const customIndex=slot.activePadIds.indexOf(id);
-      if (customIndex>=0&&slot.customInputEls[customIndex]) slot.customInputEls[customIndex].elt.value=data.labels[0].term;
+      const el=slot.padInputEls[id];
+      if (el) el.elt.value=data.labels[0].term;
     }
+    slot.padFinalized[id]=true; slot.padMode[id]='record';
+    positionPadInputs();
     padFlash[id]=millis(); triggerDrum(id);
   } catch(e) { errorMsg=e.message; setPhase('error'); }
 }
@@ -343,11 +385,20 @@ async function submitPadRecording(slot, id, blob) {
 // ── Live CLAP re-query ───────────────────────────────────────────────────────
 
 let _clapQueryTimers={};
-function queryClapLive(slot, id, customIndex) {
+function queryClapLive(slot, id) {
   clearTimeout(_clapQueryTimers[id]);
   _clapQueryTimers[id]=setTimeout(async()=>{
-    const text=slot.customInputEls[customIndex]?slot.customInputEls[customIndex].value().trim():'';
-    if (!text||!slot.sessionId) return;
+    const el=slot.padInputEls[id];
+    const text=el?el.elt.value.trim():'';
+    if (!text) return;
+    // Wait for analysis to finish if still in progress
+    if (!slot.sessionId && slot.analyzing) {
+      await new Promise(resolve => {
+        const check=()=>{ if(slot.sessionId||!slot.analyzing) resolve(); else setTimeout(check,200); };
+        check();
+      });
+    }
+    if (!slot.sessionId) return;
     try {
       const form=new FormData();
       form.append('session_id',slot.sessionId); form.append('text',text);
@@ -386,8 +437,9 @@ function mergeWordBuffers(slot, words) {
   return out;
 }
 
-function applyLyricsQuery(slot, id, customIndex) {
-  const raw=slot.customInputEls[customIndex]?slot.customInputEls[customIndex].value().trim():'';
+function applyLyricsQuery(slot, id) {
+  const el=slot.padInputEls[id];
+  const raw=el?el.elt.value.trim():'';
   const query=raw.toLowerCase().replace(/[.,!?;:'"()\-\u2014\u2013]/g,'').trim();
   if (!query) { slot.drumCandidates[id]=[]; slot.drumIdx[id]=0; return; }
   if (slot.lyricsTranscript.length===0) { slot.drumCandidates[id]=[]; slot.drumIdx[id]=0; return; }
@@ -406,6 +458,367 @@ function applyLyricsQuery(slot, id, customIndex) {
   slot.drumCandidates[id]=decoded; slot.drumIdx[id]=0;
   slot.drumTrimStart[id]=0; slot.drumTrimEnd[id]=1;
   if (decoded.length>0) padFlash[id]=millis();
+}
+
+// ── Prototype assignment ─────────────────────────────────────────────────────
+
+function applyPrototype(slot, padId, prototypeName, silent=false) {
+  const results = slot.analyzeResults[prototypeName];
+  if (!results || !results.candidates || results.candidates.length === 0) return;
+  const candidates = results.candidates.map(c => ({
+    ctxStart: c.ctx_start_s, ctxEnd: c.ctx_end_s,
+    trimStart: c.trim_start ?? 0, trimEnd: c.trim_end ?? 1,
+    normGain: c.norm_gain ?? 1.0, score: c.score, time: c.time,
+  }));
+  slot.drumCandidates[padId] = candidates;
+  slot.drumIdx[padId] = 0;
+  slot.drumTrimStart[padId] = candidates[0].trimStart;
+  slot.drumTrimEnd[padId] = candidates[0].trimEnd;
+  const el = slot.padInputEls[padId];
+  if (el) el.elt.value = prototypeName;
+  slot.padFinalized[padId] = true;
+  slot.padMode[padId] = 'prototype';
+  slot.padMenuOpen[padId] = false;
+  positionPadInputs();
+  if (!silent) { padFlash[padId] = millis(); triggerDrum(padId); }
+}
+
+// ── Session save/load ────────────────────────────────────────────────────────
+
+async function saveSession() {
+  const zip = new JSZip();
+  const manifest = {
+    version: 2,
+    savedAt: new Date().toISOString(),
+    seqBPM,
+    selectedSlotIdx,
+    globalMeasureLock,
+    globalEditMeasure,
+    slots: [],
+  };
+
+  for (let si = 0; si < slots.length; si++) {
+    const slot = slots[si];
+    const slotData = {
+      index: si,
+      fileName: slot.fileName,
+      sourceWavPath: null,
+      grid: {
+        steps: slot.grid.steps,
+        measures: slot.grid.measures.map(m => ({
+          cells: Object.fromEntries(Object.entries(m.cells).map(([k, v]) => [k, [...v]])),
+        })),
+      },
+      gridVolume: slot.gridVolume ?? 1.0,
+      swing: slot.swing ?? 0,
+      humanize: slot.humanize ?? 0,
+      muted: !!slot.muted,
+      soloed: !!slot.soloed,
+      hueOffset: slot.hueOffset || 0,
+      activePadIds: [...slot.activePadIds],
+      pads: {},
+    };
+
+    // Save source audio
+    if (slot.sourceBuffer) {
+      const wavPath = `slots/${si}/source.wav`;
+      const wav = audioBufferToWav(slot.sourceBuffer, 0, slot.sourceBuffer.duration);
+      zip.file(wavPath, wav);
+      slotData.sourceWavPath = wavPath;
+    }
+
+    // Save transcript so we don't need to re-run Whisper on load
+    if (slot.lyricsTranscript && slot.lyricsTranscript.length > 0) {
+      slotData.lyricsTranscript = slot.lyricsTranscript;
+    }
+
+    // Save pad state
+    for (const id of slot.activePadIds) {
+      const el = slot.padInputEls[id];
+      const padData = {
+        mode: slot.padMode[id] || null,
+        finalized: !!slot.padFinalized[id],
+        inputText: el ? el.elt.value : '',
+        volume: slot.drumVolumes[id] ?? 0.8,
+        pitch: slot.drumPitch[id] ?? 0,
+        trimStart: slot.drumTrimStart[id] ?? 0,
+        trimEnd: slot.drumTrimEnd[id] ?? 1,
+        candidateIdx: slot.drumIdx[id] ?? 0,
+        recLabels: slot.padRecLabels[id] || [],
+        recordWavPath: null,
+      };
+
+      // Save candidates metadata (enables instant playback on load)
+      const cands = slot.drumCandidates[id];
+      if (cands && cands.length > 0) {
+        padData.candidates = cands.map(c => ({
+          ctxStart: c.ctxStart, ctxEnd: c.ctxEnd,
+          trimStart: c.trimStart, trimEnd: c.trimEnd,
+          normGain: c.normGain, score: c.score, time: c.time,
+        }));
+      }
+
+      // Save record-mode pad audio
+      if (slot.padMode[id] === 'record') {
+        if (cands && cands.length > 0 && cands[0].buffer) {
+          const wavPath = `pads/${id}_slot_${si}.wav`;
+          const wav = audioBufferToWav(cands[0].buffer, 0, cands[0].buffer.duration);
+          zip.file(wavPath, wav);
+          padData.recordWavPath = wavPath;
+        }
+      }
+
+      slotData.pads[id] = padData;
+    }
+
+    manifest.slots.push(slotData);
+  }
+
+  zip.file('manifest.json', JSON.stringify(manifest, null, 2));
+  const blob = await zip.generateAsync({ type: 'blob' });
+
+  // Try native Save As dialog (Chrome/Edge), fall back to <a> download
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: 'session.boxer',
+        types: [{ description: 'Boxer Session', accept: { 'application/octet-stream': ['.boxer'] } }]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return;
+    } catch (e) {
+      if (e.name === 'AbortError') return; // user cancelled
+      // API error — fall through to <a> download
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'session.boxer';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+async function loadSession() {
+  let file;
+  if (window.showOpenFilePicker) {
+    try {
+      const [handle] = await window.showOpenFilePicker({
+        types: [{ description: 'Boxer Session', accept: { 'application/octet-stream': ['.boxer', '.zip'] } }]
+      });
+      file = await handle.getFile();
+    } catch (e) {
+      if (e.name === 'AbortError') return; // user cancelled
+      // API error — fall through to <input> picker
+    }
+  }
+  if (!file) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.boxer,.zip';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    file = await new Promise(resolve => {
+      input.addEventListener('change', () => resolve(input.files[0]));
+      input.click();
+    });
+    document.body.removeChild(input);
+    if (!file) return;
+  }
+
+  const zip = await JSZip.loadAsync(file);
+  const manifestText = await zip.file('manifest.json').async('string');
+  const manifest = JSON.parse(manifestText);
+  if (manifest.version !== 1 && manifest.version !== 2) { errorMsg = 'Unsupported session version'; setPhase('error'); return; }
+
+  // Stop sequencer, clear state
+  if (seqPlaying) stopSequencer();
+  clearAllSlots();
+
+  seqBPM = manifest.seqBPM ?? 120;
+  globalMeasureLock = !!manifest.globalMeasureLock;
+  globalEditMeasure = manifest.globalEditMeasure ?? 0;
+  // Keep one empty slot so draw() never sees an empty array
+  slots = [createSlot()];
+  selectedSlotIdx = 0;
+
+  const loadedSlots = [];
+  for (let si = 0; si < manifest.slots.length; si++) {
+    const sd = manifest.slots[si];
+    const slot = createSlot();
+    slot.fileName = sd.fileName;
+    slot.grid.steps = sd.grid.steps ?? 16;
+    slot.gridVolume = sd.gridVolume ?? 1.0;
+    slot.swing = sd.swing ?? 0;
+    slot.humanize = sd.humanize ?? 0;
+    slot.muted = !!sd.muted;
+    slot.soloed = !!sd.soloed;
+    if (sd.hueOffset !== undefined) slot.hueOffset = sd.hueOffset;
+    // Legacy: per-slot measureLock → global
+    if (sd.measureLock) globalMeasureLock = true;
+
+    // Restore grid cells (v2: measures array, v1: flat cells -> migrate)
+    if (sd.grid.measures) {
+      slot.grid.measures = sd.grid.measures.map(m => ({
+        cells: Object.fromEntries(Object.entries(m.cells).map(([k, v]) => [k, [...v]])),
+      }));
+    } else if (sd.grid.cells) {
+      slot.grid.measures = [{ cells: Object.fromEntries(Object.entries(sd.grid.cells).map(([k, v]) => [k, [...v]])) }];
+    }
+    slot.grid.editMeasure = 0;
+
+    // Decode source audio
+    if (sd.sourceWavPath) {
+      const wavData = await zip.file(sd.sourceWavPath).async('arraybuffer');
+      slot.sourceBuffer = await audioCtx.decodeAudioData(wavData.slice(0));
+    }
+
+    // Restore pads
+    for (const id of sd.activePadIds) {
+      const def = getPadDef(id);
+      if (!def) continue;
+      const pd = sd.pads[id];
+      if (!pd) continue;
+
+      slot.padMode[id] = pd.mode;
+      slot.padFinalized[id] = pd.finalized;
+      slot.drumVolumes[id] = pd.volume;
+      slot.drumPitch[id] = pd.pitch;
+      slot.drumTrimStart[id] = pd.trimStart;
+      slot.drumTrimEnd[id] = pd.trimEnd;
+      slot.drumIdx[id] = pd.candidateIdx;
+      slot.padRecLabels[id] = pd.recLabels || [];
+
+      _addPadToSlot(slot, def);
+      const el = slot.padInputEls[id];
+      if (el) {
+        el.elt.value = pd.inputText || '';
+        if (pd.finalized) el.elt.readOnly = true;
+      }
+
+      // Restore saved candidates immediately (enables playback before analysis)
+      if (pd.mode === 'record' && pd.recordWavPath) {
+        const padWav = await zip.file(pd.recordWavPath).async('arraybuffer');
+        const buf = await audioCtx.decodeAudioData(padWav.slice(0));
+        slot.drumCandidates[id] = [{ buffer: buf, score: 1.0, time: 0, trimStart: 0, trimEnd: 1 }];
+      } else if (pd.candidates && pd.candidates.length > 0) {
+        slot.drumCandidates[id] = pd.candidates.map(c => ({
+          ctxStart: c.ctxStart, ctxEnd: c.ctxEnd,
+          trimStart: c.trimStart, trimEnd: c.trimEnd,
+          normGain: c.normGain, score: c.score, time: c.time,
+        }));
+      }
+    }
+
+    loadedSlots.push(slot);
+  }
+
+  // Remove placeholder and swap in loaded slots
+  Object.values(slots[0].padInputEls).forEach(w => w.elt.remove());
+  slots = loadedSlots.length > 0 ? loadedSlots : [createSlot()];
+  _nextSteps = slots.map(() => 0);
+  selectedSlotIdx = Math.min(manifest.selectedSlotIdx ?? 0, slots.length - 1);
+  // Mark slots for re-analysis before updating visibility
+  slots.forEach(slot => { if (slot.sourceBuffer) slot.analyzing = true; });
+  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+
+  // Re-analyze slots that have source audio (async, parallel)
+  slots.forEach((slot, si) => {
+    const sd = manifest.slots[si];
+    if (!slot.sourceBuffer || !sd) return;
+    const wav = audioBufferToWav(slot.sourceBuffer, 0, slot.sourceBuffer.duration);
+    const wavBlob = new Blob([wav], { type: 'audio/wav' });
+
+    // Restore transcript from manifest (or fall back to re-transcribing)
+    if (sd.lyricsTranscript && sd.lyricsTranscript.length > 0) {
+      slot.lyricsTranscript = sd.lyricsTranscript;
+      slot.transcriptLoaded = true;
+      // Re-apply lyrics pads immediately using saved transcript
+      slot.activePadIds.forEach(id => {
+        const pd = sd.pads[id];
+        if (pd && pd.mode === 'lyrics') {
+          applyLyricsQuery(slot, id);
+          slot.drumTrimStart[id] = pd.trimStart;
+          slot.drumTrimEnd[id] = pd.trimEnd;
+          slot.drumIdx[id] = pd.candidateIdx;
+        }
+      });
+    } else {
+      // Legacy .boxer files without saved transcript — re-transcribe
+      const transcribeForm = new FormData();
+      transcribeForm.append('file', wavBlob, 'audio.wav');
+      fetch(`${BACKEND}/transcribe`, { method: 'POST', body: transcribeForm })
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+          if (!data) return;
+          slot.lyricsTranscript = data.words || [];
+          slot.transcriptLoaded = true;
+          slot.activePadIds.forEach(id => {
+            const pd = sd.pads[id];
+            if (pd && pd.mode === 'lyrics') {
+              applyLyricsQuery(slot, id);
+              slot.drumTrimStart[id] = pd.trimStart;
+              slot.drumTrimEnd[id] = pd.trimEnd;
+              slot.drumIdx[id] = pd.candidateIdx;
+            }
+          });
+        }).catch(e => console.warn('[load:transcribe] failed:', e));
+    }
+
+    // Analyze
+    const analyzeForm = new FormData();
+    analyzeForm.append('file', wavBlob, 'audio.wav');
+    const customTexts = {};
+    slot.activePadIds.forEach(id => {
+      const pd = sd.pads[id];
+      if (pd && pd.inputText) customTexts[id] = pd.inputText;
+    });
+    analyzeForm.append('custom_texts', JSON.stringify(customTexts));
+    fetch(`${BACKEND}/analyze`, { method: 'POST', body: analyzeForm })
+      .then(r => { if (!r.ok) throw new Error('analyze failed'); return r.json(); })
+      .then(data => {
+        slot.sessionId = data.session_id || null;
+        slot.analyzeResults = data.drums || {};
+        // Re-apply prototype and custom (describe) pads
+        slot.activePadIds.forEach(id => {
+          const pd = sd.pads[id];
+          if (!pd) return;
+          if (pd.mode === 'prototype') {
+            const protoName = pd.inputText;
+            if (protoName && slot.analyzeResults[protoName]) {
+              applyPrototype(slot, id, protoName, true);
+              slot.drumTrimStart[id] = pd.trimStart;
+              slot.drumTrimEnd[id] = pd.trimEnd;
+              slot.drumIdx[id] = pd.candidateIdx;
+            }
+          } else if (!pd.mode && pd.inputText) {
+            // Custom CLAP text query pad — results come back keyed by pad ID
+            const results = slot.analyzeResults[id];
+            if (results && results.candidates && results.candidates.length > 0) {
+              const candidates = results.candidates.map(c => ({
+                ctxStart: c.ctx_start_s, ctxEnd: c.ctx_end_s,
+                trimStart: c.trim_start ?? 0, trimEnd: c.trim_end ?? 1,
+                normGain: c.norm_gain ?? 1.0, score: c.score, time: c.time,
+              }));
+              slot.drumCandidates[id] = candidates;
+              slot.drumIdx[id] = pd.candidateIdx;
+              slot.drumTrimStart[id] = pd.trimStart;
+              slot.drumTrimEnd[id] = pd.trimEnd;
+            }
+          }
+        });
+        slot.analyzing = false;
+        rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+      })
+      .catch(e => {
+        console.warn('[load:analyze] failed:', e);
+        slot.analyzing = false;
+      });
+  });
 }
 
 // ── Tap tempo ────────────────────────────────────────────────────────────────

@@ -9,18 +9,18 @@
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html { height: 100%; background: #EDE8DF; }
-    body { min-width: 700px; height: 100%; overflow-x: auto; overflow-y: hidden; background: #EDE8DF; }
+    html { height: 100%; background: #E6E9ED; }
+    body { min-width: 775px; height: 100%; overflow-x: auto; overflow-y: hidden; background: #E6E9ED; }
     canvas { display: block; }
     #upload-input { display: none; }
 
-    .custom-input {
+    .pad-input {
       position: absolute;
       background: transparent;
       border: none;
       border-bottom: 1px solid rgba(0,0,0,0.35);
       color: rgba(0,0,0,0.75);
-      font-family: 'IBM Plex Mono', monospace;
+      font-family: 'Silkscreen', monospace;
       font-size: 11px;
       text-align: center;
       width: 100px;
@@ -28,14 +28,17 @@
       display: none;
       padding: 2px 4px;
       pointer-events: auto;
+      text-overflow: ellipsis;
+      overflow: hidden;
     }
-    .custom-input::placeholder { color: rgba(0,0,0,0.45); font-style: italic; }
-    .custom-input:focus { border-bottom-color: rgba(0,0,0,0.7); }
+    .pad-input::placeholder { color: rgba(0,0,0,0.45); font-style: italic; }
+    .pad-input:focus { border-bottom-color: rgba(0,0,0,0.7); }
   </style>
 </head>
 <body>
   <input type="file" id="upload-input" accept="audio/*">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.3/p5.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="config.js?v=5"></script>
   <script src="state.js?v=5"></script>
   <script src="render.js?v=5"></script>

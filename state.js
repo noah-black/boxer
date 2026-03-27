@@ -15,8 +15,7 @@ function getActivePads(slot) {
 /** Get pads visible in the sequencer (with content). */
 function getSeqPads(slot) {
   return getActivePads(slot).filter(def => {
-    const el = slot.padInputEls[def.id];
-    const textValue = el ? el.elt.value.trim() : '';
+    const textValue = (slot.padText[def.id] || '').trim();
     return (slot.drumCandidates[def.id] && slot.drumCandidates[def.id].length > 0) || textValue !== '';
   });
 }
@@ -45,11 +44,23 @@ let recStart = 0, analyserNode = null, waveformData = null;
 let audioCtx = null, uploadEl = null;
 let pickerOpen = false, pickerSlot = null, pickerPadId = null;
 let pickerSel = [], pickerAnchor = null, pickerEl = null, pickerDragging = false;
+let cellPitchDropdown = null; // { slotIdx, padId, stepIdx, x, y, cellW, cellH, currentPitch }
 let errorMsg = '', spinAngle = 0;
 let trimState = null;
 let trimPlaySrc = null;
 let trimPlayStartTime = 0, trimPlayStartSec = 0;
-let padRecAnalyser = null, padRecWaveformData = null, padRecordingId = null;
+let selectedPadId = null;
+let _sharedInputEl = null;
+
+
+// ── Pitched buffer cache (for preserve-tempo pitch shifting) ─────────────
+let _pitchedBufferCache = {};
+function pitchedCacheKey(si, id, st, spd) { return si + '_' + id + '_' + st + '_' + spd; }
+function invalidatePitchedCache(si, id) {
+  Object.keys(_pitchedBufferCache).forEach(k => {
+    if (k.startsWith(si + '_' + id + '_')) delete _pitchedBufferCache[k];
+  });
+}
 
 // ── Keyboard map ─────────────────────────────────────────────────────────────
 let _kbdMap = {};
@@ -71,6 +82,7 @@ rebuildKbdMap();
 
 function addSlot() {
   const slot = createSlot();
+  ensureAllPads(slot);
   slots.push(slot);
   if (seqPlaying) { _nextSteps.push(0); _measurePhase.push(0); }
   selectSlot(slots.length-1);
@@ -78,23 +90,22 @@ function addSlot() {
 
 function clearAllSlots() {
   if (pickerOpen) closePicker();
-  slots.forEach(slot => {
-    Object.values(slot.padInputEls).forEach(w => w.elt.remove());
-  });
   slots = [createSlot()];
+  ensureAllPads(slots[0]);
   selectedSlotIdx = 0;
+  selectedPadId = null;
   _nextSteps = [0]; _measurePhase = [0];
-  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+  syncSharedInput(); rebuildKbdMap(); positionSharedInput(); updateElementVisibility();
 }
 
 function removeSlot(slotIndex) {
   if (slots.length <= 1) return;
   if (pickerSlot === slots[slotIndex]) closePicker();
-  Object.values(slots[slotIndex].padInputEls).forEach(w => w.elt.remove());
   slots.splice(slotIndex, 1);
   if (seqPlaying) { _nextSteps.splice(slotIndex, 1); _measurePhase.splice(slotIndex, 1); }
   selectedSlotIdx = Math.min(selectedSlotIdx, slots.length - 1);
-  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+  selectedPadId = currentSlot().activePadIds[0] || null;
+  syncSharedInput(); rebuildKbdMap(); positionSharedInput(); updateElementVisibility();
 }
 
 function duplicateSlot(slotIndex) {
@@ -103,6 +114,7 @@ function duplicateSlot(slotIndex) {
     steps: src.grid.steps,
     measures: src.grid.measures.map(m => ({
       cells: Object.fromEntries(Object.entries(m.cells).map(([k, v]) => [k, [...v]])),
+      cellPitch: Object.fromEntries(Object.entries(m.cellPitch || {}).map(([k, v]) => [k, [...v]])),
     })),
     editMeasure: src.grid.editMeasure,
   };
@@ -116,9 +128,11 @@ function duplicateSlot(slotIndex) {
     dst.drumPitch[id]     = src.drumPitch[id] ?? 0;
     dst.drumTrimStart[id] = src.drumTrimStart[id] ?? 0;
     dst.drumTrimEnd[id]   = src.drumTrimEnd[id] ?? 1;
+    dst.drumEQ[id]        = { ...(src.drumEQ[id] || { low: 0, mid: 0, high: 0 }) };
+    dst.drumSpeed[id]     = src.drumSpeed[id] ?? 1.0;
+    dst.drumPitchSpeedLinked[id] = src.drumPitchSpeedLinked[id] ?? true;
     dst.padMode[id]       = src.padMode[id] ?? null;
     dst.padFinalized[id]  = src.padFinalized[id] ?? false;
-    dst.padRecLabels[id]  = [...(src.padRecLabels[id] || [])];
   });
   dst.sessionId = src.sessionId; dst.sourceBuffer = src.sourceBuffer;
   dst.analyzeResults = JSON.parse(JSON.stringify(src.analyzeResults || {}));
@@ -127,20 +141,41 @@ function duplicateSlot(slotIndex) {
   src.activePadIds.forEach(id => {
     const def = getPadDef(id); if (!def) return;
     _addPadToSlot(dst, def);
-    const srcEl = src.padInputEls[id], dstEl = dst.padInputEls[id];
-    if (srcEl && dstEl) dstEl.elt.value = srcEl.elt.value;
+    dst.padText[id] = src.padText[id] || '';
   });
+  ensureAllPads(dst);
   slots.splice(slotIndex + 1, 0, dst);
-  if (seqPlaying) { _nextSteps.splice(slotIndex + 1, 0, 0); _measurePhase.splice(slotIndex + 1, 0, 0); }
+  if (seqPlaying) { _nextSteps.splice(slotIndex + 1, 0, _nextSteps[slotIndex]); _measurePhase.splice(slotIndex + 1, 0, _measurePhase[slotIndex]); }
 }
 
 function selectSlot(slotIndex) {
   if (slotIndex < 0 || slotIndex >= slots.length || slotIndex === selectedSlotIdx) return;
-  const old = currentSlot();
-  Object.values(old.padInputEls).forEach(el => { el.elt.style.display = 'none'; });
   selectedSlotIdx = slotIndex;
-  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+  // Auto-select first pad of new slot
+  const slot = currentSlot();
+  selectedPadId = slot.activePadIds.length > 0 ? slot.activePadIds[0] : null;
+  syncSharedInput();
+  rebuildKbdMap(); positionSharedInput(); updateElementVisibility();
   if (pickerOpen && pickerSlot !== currentSlot()) closePicker();
+}
+
+function selectPad(id) {
+  selectedPadId = id;
+  syncSharedInput();
+  positionSharedInput();
+}
+
+/** Sync the shared input element to the currently selected pad. */
+function syncSharedInput() {
+  if (!_sharedInputEl) return;
+  const slot = currentSlot();
+  if (!selectedPadId || !slot.activePadIds.includes(selectedPadId)) {
+    _sharedInputEl.style.display = 'none';
+    return;
+  }
+  _sharedInputEl.value = slot.padText[selectedPadId] || '';
+  _sharedInputEl.readOnly = !!slot.padFinalized[selectedPadId];
+  _sharedInputEl.style.borderBottom = slot.padFinalized[selectedPadId] ? 'none' : '1px solid rgba(0,0,0,0.35)';
 }
 
 // ── Pad management ──────────────────────────────────────────────────────────
@@ -156,73 +191,26 @@ function _addPadToSlot(slot, def) {
   slot.drumCandidates[def.id] = slot.drumCandidates[def.id] || [];
   slot.drumIdx[def.id]        = slot.drumIdx[def.id]        || 0;
   slot.padMode[def.id]        = slot.padMode[def.id]        ?? null;
-  slot.padRecording[def.id]   = false;
-  slot.padRecLabels[def.id]   = slot.padRecLabels[def.id]   || [];
-  slot.padRecorders[def.id]   = null;
   slot.padFinalized[def.id]   = slot.padFinalized[def.id]   ?? false;
   slot.padMenuOpen[def.id]    = false;
+  slot.padText[def.id]        = slot.padText[def.id]        ?? '';
+  slot.drumEQ[def.id]         = slot.drumEQ[def.id]         ?? { low: 0, mid: 0, high: 0 };
+  slot.drumSpeed[def.id]      = slot.drumSpeed[def.id]      ?? 1.0;
+  slot.drumPitchSpeedLinked[def.id] = slot.drumPitchSpeedLinked[def.id] ?? true;
   slot.grid.measures.forEach(m => {
     m.cells[def.id] = m.cells[def.id] || new Array(slot.grid.steps).fill(false);
+    if (!m.cellPitch) m.cellPitch = {};
+    m.cellPitch[def.id] = m.cellPitch[def.id] || new Array(slot.grid.steps).fill(0);
   });
   if (!gainNodes[def.id]) {
     const node = audioCtx.createGain(); node.gain.value = 1.0;
     node.connect(audioCtx.destination); gainNodes[def.id] = node;
   }
-  if (!slot.padInputEls[def.id]) {
-    const inputEl = document.createElement('input');
-    inputEl.type = 'text'; inputEl.className = 'pad-input'; inputEl.placeholder = 'describe\u2026';
-    inputEl.addEventListener('keydown', e => {
-      e.stopPropagation();
-      if (e.key==='Enter') {
-        if (inputEl.value.trim()) { slot.padFinalized[def.id]=true; positionPadInputs(); }
-        inputEl.blur();
-      }
-    });
-    inputEl.addEventListener('input', () => {
-      if (slot.padFinalized[def.id]) return;
-      const mode = slot.padMode[def.id];
-      if (mode==='lyrics') applyLyricsQuery(slot, def.id);
-      else if (slot.sessionId) queryClapLive(slot, def.id);
-    });
-    document.body.appendChild(inputEl);
-    slot.padInputEls[def.id] = makeInputWrapper(inputEl);
-  }
 }
 
-function addPad() {
-  const slot = currentSlot();
-  if (slot.activePadIds.length >= PAD_DEFS.length) return;
-  const def = PAD_DEFS.find(d => !slot.activePadIds.includes(d.id));
-  if (!def) return;
-  _addPadToSlot(slot, def);
-  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
-}
-
-function addPadWithPrototype(prototypeName) {
-  const slot = currentSlot();
-  if (slot.activePadIds.length >= PAD_DEFS.length) return;
-  const def = PAD_DEFS.find(d => !slot.activePadIds.includes(d.id));
-  if (!def) return;
-  _addPadToSlot(slot, def);
-  applyPrototype(slot, def.id, prototypeName);
-  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
-}
-
-function removePad(id) {
-  const slot = currentSlot();
-  const padIndex = slot.activePadIds.indexOf(id); if (padIndex < 0) return;
-  if (pickerPadId === id) closePicker();
-  slot.activePadIds.splice(padIndex, 1);
-  const wrapper = slot.padInputEls[id]; if (wrapper) wrapper.elt.remove();
-  delete slot.padInputEls[id];
-  delete slot.padFinalized[id]; delete slot.padMode[id]; delete slot.padMenuOpen[id];
-  delete slot.drumCandidates[id]; delete slot.drumIdx[id];
-  delete slot.drumVolumes[id];    delete slot.drumPitch[id];
-  delete slot.drumTrimStart[id];  delete slot.drumTrimEnd[id];
-  delete padFlash[id];            delete padHeld[id];
-  delete slot.padRecording[id];   delete slot.padRecLabels[id]; delete slot.padRecorders[id];
-  slot.grid.measures.forEach(m => { delete m.cells[id]; });
-  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+/** Ensure all 16 PAD_DEFS are active in a slot. Called after audioCtx is available. */
+function ensureAllPads(slot) {
+  PAD_DEFS.forEach(def => _addPadToSlot(slot, def));
 }
 
 /** Re-initialize a pad: clear its sound and restore the editable state. */
@@ -231,32 +219,49 @@ function clearPad(id) {
   slot.padFinalized[id] = false;
   slot.padMode[id] = null;
   slot.padMenuOpen[id] = false;
-  const el = slot.padInputEls[id];
-  if (el) { el.elt.value = ''; el.elt.readOnly = false; }
+  slot.padText[id] = '';
   slot.drumCandidates[id] = []; slot.drumIdx[id] = 0;
   slot.drumTrimStart[id] = 0; slot.drumTrimEnd[id] = 1;
-  positionPadInputs();
+  slot.drumEQ[id] = { low: 0, mid: 0, high: 0 };
+  slot.drumSpeed[id] = 1.0;
+  slot.drumPitchSpeedLinked[id] = true;
+  invalidatePitchedCache(selectedSlotIdx, id);
+  syncSharedInput(); positionSharedInput();
 }
 
 // ── Measure management ──────────────────────────────────────────────────────
 function addMeasure(slotIndex) {
   const slot = slots[slotIndex], grid = slot.grid;
   if (grid.measures.length >= MAX_MEASURES) return;
-  const newCells = {};
+  const newCells = {}, newCellPitch = {};
   getActivePads(slot).forEach(def => {
     newCells[def.id] = new Array(grid.steps).fill(false);
+    newCellPitch[def.id] = new Array(grid.steps).fill(0);
   });
-  grid.measures.push({ cells: newCells });
+  grid.measures.push({ cells: newCells, cellPitch: newCellPitch });
   grid.editMeasure = grid.measures.length - 1;
+  _syncMeasurePhase(slotIndex);
 }
 
 function duplicateMeasure(slotIndex, measureIdx) {
   const slot = slots[slotIndex], grid = slot.grid;
   if (grid.measures.length >= MAX_MEASURES) return;
   const src = grid.measures[measureIdx];
-  const cloned = { cells: Object.fromEntries(Object.entries(src.cells).map(([k, v]) => [k, [...v]])) };
+  const cloned = {
+    cells: Object.fromEntries(Object.entries(src.cells).map(([k, v]) => [k, [...v]])),
+    cellPitch: Object.fromEntries(Object.entries(src.cellPitch || {}).map(([k, v]) => [k, [...v]])),
+  };
   grid.measures.splice(measureIdx + 1, 0, cloned);
   grid.editMeasure = measureIdx + 1;
+  _syncMeasurePhase(slotIndex);
+}
+
+/** After measure count changes, sync _measurePhase so this slot
+ *  is on the same measure as any other slot with the same count. */
+function _syncMeasurePhase(slotIndex) {
+  if (!seqPlaying) return;
+  const nM = slots[slotIndex].grid.measures.length;
+  _measurePhase[slotIndex] = _totalLoops % nM;
 }
 
 function removeMeasure(slotIndex, measureIdx) {
@@ -264,6 +269,7 @@ function removeMeasure(slotIndex, measureIdx) {
   if (grid.measures.length <= 1) return;
   grid.measures.splice(measureIdx, 1);
   if (grid.editMeasure >= grid.measures.length) grid.editMeasure = grid.measures.length - 1;
+  _syncMeasurePhase(slotIndex);
 }
 
 function reorderMeasures(slotIndex, fromIdx, toIdx) {
@@ -278,6 +284,11 @@ function reorderMeasures(slotIndex, fromIdx, toIdx) {
 function editCells(slot) {
   return slot.grid.measures[slot.grid.editMeasure].cells;
 }
+function editCellPitch(slot) {
+  const m = slot.grid.measures[slot.grid.editMeasure];
+  if (!m.cellPitch) m.cellPitch = {};
+  return m.cellPitch;
+}
 
 // ── Step count control ───────────────────────────────────────────────────────
 function setStepCount(slotIndex, newSteps) {
@@ -287,10 +298,17 @@ function setStepCount(slotIndex, newSteps) {
   // Extend arrays if growing, but never shrink — preserves steps beyond the visible range
   if (newSteps > slot.grid.steps) {
     slot.grid.measures.forEach(m => {
+      if (!m.cellPitch) m.cellPitch = {};
       getActivePads(slot).forEach(def => {
         const old = m.cells[def.id];
         if (old && old.length < newSteps) {
           m.cells[def.id] = old.concat(new Array(newSteps - old.length).fill(false));
+        }
+        const oldP = m.cellPitch[def.id];
+        if (oldP && oldP.length < newSteps) {
+          m.cellPitch[def.id] = oldP.concat(new Array(newSteps - oldP.length).fill(0));
+        } else if (!oldP) {
+          m.cellPitch[def.id] = new Array(newSteps).fill(0);
         }
       });
     });
@@ -305,7 +323,7 @@ function openStepEdit(slotIndex, screenX, screenY, w, h) {
     _stepEditInput.inputMode = 'numeric';
     _stepEditInput.style.cssText = [
       "position:fixed", "z-index:200", "text-align:center",
-      "font-family:'Silkscreen',monospace", "font-size:"+(7*UI_SCALE)+"px",
+      "font-family:'"+_debugFont+"',monospace", "font-size:"+(7*UI_SCALE)+"px",
       "border:none", "outline:none", "background:transparent", "color:#222",
       "padding:0", "display:none",
     ].join(';');
@@ -371,7 +389,7 @@ function reorderPads(fromIdx, toIdx) {
   const id = slot.activePadIds.splice(fromIdx, 1)[0];
   const insertAt = toIdx > fromIdx ? toIdx - 1 : toIdx;
   slot.activePadIds.splice(insertAt, 0, id);
-  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+  rebuildKbdMap(); positionSharedInput(); updateElementVisibility();
 }
 
 // ── Phase management ─────────────────────────────────────────────────────────

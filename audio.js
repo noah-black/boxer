@@ -63,10 +63,13 @@ function posToStep(pos, stepPositions) {
 
 // ── Sequencer ────────────────────────────────────────────────────────────────
 
+let _totalLoops = 0;
+
 function startSequencer() {
   if (audioCtx.state==='suspended') audioCtx.resume();
   _nextSteps=slots.map(()=>0);
   _measurePhase=slots.map(()=>0);
+  _totalLoops=0;
   _loopStartTime=audioCtx.currentTime+0.05;
   seqPlaying=true; scheduleLoop();
 }
@@ -82,6 +85,7 @@ function scheduleLoop() {
   const now=audioCtx.currentTime, loopDur=loopDuration();
   while (now>=_loopStartTime+loopDur) {
     _loopStartTime+=loopDur;
+    _totalLoops++;
     slots.forEach((slot,slotIndex) => {
       if (_nextSteps[slotIndex]!==undefined) _nextSteps[slotIndex]=Math.max(0,(_nextSteps[slotIndex]||0)-slot.grid.steps);
       const nM=slot.grid.measures.length;
@@ -109,9 +113,12 @@ function scheduleLoop() {
       if (time>now+SCHEDULE_AHEAD) break;
       if (!slotSilenced) {
         const mCells=grid.measures[measureIdx].cells;
+        const mCP=grid.measures[measureIdx].cellPitch;
         getActivePads(slot).forEach(drum => {
-          if (mCells[drum.id]&&mCells[drum.id][stepInMeasure])
-            triggerDrumAtTime(slot,drum.id,time);
+          if (mCells[drum.id]&&mCells[drum.id][stepInMeasure]) {
+            const cp=(mCP&&mCP[drum.id])?(mCP[drum.id][stepInMeasure]||0):0;
+            triggerDrumAtTime(slot,drum.id,time,cp);
+          }
         });
       }
       if (slotIndex===0&&seqRecording&&stepInMeasure%4===0&&stepInMeasure>0)
@@ -124,32 +131,212 @@ function scheduleLoop() {
 
 // ── Drum playback ────────────────────────────────────────────────────────────
 
-function playCandidate(slot, id, cand, when, volScale=1.0) {
+/** Pitch-shift an AudioBuffer using SoundTouch WSOLA.
+ *  Input is already the trimmed region; output plays from the start. */
+function renderPitchedBuffer(inputBuffer, semitones, speed) {
+  const st = new SoundTouchLib.SoundTouch();
+  st.pitchSemitones = semitones;
+  if (speed !== undefined && speed !== 1.0) st.tempo = speed;
+
+  const nChan = inputBuffer.numberOfChannels;
+  const sr = inputBuffer.sampleRate;
+  const len = inputBuffer.length;
+  const left = inputBuffer.getChannelData(0);
+  const right = nChan > 1 ? inputBuffer.getChannelData(1) : left;
+
+  // Pad input with silence so WSOLA has clean runway at the tail.
+  // SoundTouch's overlap-add needs extra material beyond the real audio
+  // to form clean windows, especially when pitching up (consumes input faster).
+  const pitchRatio = Math.pow(2, Math.abs(semitones) / 12);
+  const padSamples = Math.ceil(sr * 0.2 * pitchRatio);
+  const paddedLen = len + padSamples;
+
+  const source = {
+    extract(target, numFrames, position) {
+      const avail = Math.min(numFrames, paddedLen - position);
+      for (let i = 0; i < avail; i++) {
+        const si = position + i;
+        target[i * 2]     = si < len ? left[si] : 0;
+        target[i * 2 + 1] = si < len ? right[si] : 0;
+      }
+      return avail;
+    }
+  };
+
+  const filter = new SoundTouchLib.SimpleFilter(source, st);
+  const chunkSize = 4096;
+  const chunks = [];
+  let totalFrames = 0;
+  const effectiveTempo = (speed !== undefined && speed !== 1.0) ? speed : 1.0;
+  const expectedLen = Math.round(len / effectiveTempo);
+  // Over-read to flush WSOLA internal buffers
+  const maxFrames = expectedLen + padSamples + sr;
+  while (totalFrames < maxFrames) {
+    const tmp = new Float32Array(chunkSize * 2);
+    const got = filter.extract(tmp, chunkSize);
+    if (got === 0) break;
+    chunks.push({ data: tmp, frames: got });
+    totalFrames += got;
+  }
+
+  // De-interleave into AudioBuffer, clamped to expectedLen
+  const actualLen = Math.min(totalFrames, expectedLen);
+  const result = audioCtx.createBuffer(nChan, actualLen, sr);
+  const outL = result.getChannelData(0);
+  const outR = nChan > 1 ? result.getChannelData(1) : null;
+  let written = 0;
+  for (const c of chunks) {
+    for (let i = 0; i < c.frames && written < actualLen; i++) {
+      outL[written] = c.data[i * 2];
+      if (outR) outR[written] = c.data[i * 2 + 1];
+      written++;
+    }
+  }
+  return result;
+}
+
+/** Remap saved per-pad trim fractions from a candidate's original context
+ *  window to full-source fractions.  For files saved after widening was added
+ *  (ctxStart≈0, ctxEnd≈sourceDur) this is effectively a no-op. */
+function remapSavedTrim(pd, sourceDur) {
+  const cands = pd.candidates;
+  if (!cands || cands.length === 0 || sourceDur <= 0) return { ts: pd.trimStart ?? 0, te: pd.trimEnd ?? 1 };
+  const c0 = cands[pd.candidateIdx ?? 0] || cands[0];
+  const oldStart = c0.ctxStart ?? 0;
+  const oldEnd = c0.ctxEnd ?? sourceDur;
+  const oldDur = oldEnd - oldStart;
+  if (oldDur <= 0) return { ts: pd.trimStart ?? 0, te: pd.trimEnd ?? 1 };
+  const absStart = oldStart + (pd.trimStart ?? 0) * oldDur;
+  const absEnd = oldStart + (pd.trimEnd ?? 1) * oldDur;
+  return { ts: absStart / sourceDur, te: absEnd / sourceDur };
+}
+
+/** Widen a candidate's context window to the full source buffer duration.
+ *  Trim fractions are remapped so the audible region stays the same. */
+function widenCandidateContext(cand, sourceDur) {
+  if (cand.buffer) return cand;  // standalone buffer, nothing to widen
+  const oldStart = cand.ctxStart ?? 0;
+  const oldEnd = cand.ctxEnd ?? sourceDur;
+  const oldDur = oldEnd - oldStart;
+  if (oldDur <= 0 || sourceDur <= 0) return cand;
+  // Remap trim fractions from old context to full source
+  const absStart = oldStart + (cand.trimStart ?? 0) * oldDur;
+  const absEnd = oldStart + (cand.trimEnd ?? 1) * oldDur;
+  cand.ctxStart = 0;
+  cand.ctxEnd = sourceDur;
+  cand.trimStart = absStart / sourceDur;
+  cand.trimEnd = absEnd / sourceDur;
+  return cand;
+}
+
+/** Extract a candidate's audio region into a standalone AudioBuffer. */
+function extractCandidateBuffer(slot, cand) {
+  if (cand.buffer) return cand.buffer;
+  if (!slot.sourceBuffer) return null;
+  const sr = slot.sourceBuffer.sampleRate;
+  const nChan = slot.sourceBuffer.numberOfChannels;
+  const startSamp = Math.max(0, Math.floor((cand.ctxStart || 0) * sr));
+  const endSamp = Math.min(slot.sourceBuffer.length, Math.ceil((cand.ctxEnd || slot.sourceBuffer.duration) * sr));
+  const len = endSamp - startSamp;
+  if (len <= 0) return null;
+  const buf = audioCtx.createBuffer(nChan, len, sr);
+  for (let ch = 0; ch < nChan; ch++) {
+    buf.copyToChannel(slot.sourceBuffer.getChannelData(ch).subarray(startSamp, endSamp), ch);
+  }
+  return buf;
+}
+
+function playCandidate(slot, id, cand, when, volScale=1.0, cellPitch=0) {
   const src=audioCtx.createBufferSource();
-  src.playbackRate.value=Math.pow(2,(slot.drumPitch[id]??0)/12);
+  const baseSemitones = slot.drumPitch[id] ?? 0;
+  const semitones = baseSemitones + cellPitch;
+  const linked = slot.drumPitchSpeedLinked[id] ?? true;
+  // Force WSOLA (speed-locked) when cellPitch is non-zero
+  const forceWSola = cellPitch !== 0;
+  const speed = (linked && !forceWSola) ? Math.pow(2, semitones/12) : (slot.drumSpeed[id] ?? 1.0);
+  const needWSola = forceWSola || (!linked && (semitones !== 0 || speed !== 1.0));
+
+  if (!needWSola) {
+    src.playbackRate.value = linked ? speed : 1.0;
+  }
+
   const effectiveVol=(slot.drumVolumes[id]??0.8)*volScale;
+  // Use in-flight drag trim values if actively dragging this pad's trim handles
+  let ts=slot.drumTrimStart[id]??0, te=slot.drumTrimEnd[id]??1;
+  const si = slots.indexOf(slot);
+  if (drag&&(drag.type==='trimStart'||drag.type==='trimEnd')&&drag.id===id&&(drag.slotIdx??-1)===si) {
+    ts=drag.proposedStart??ts; te=drag.proposedEnd??te;
+  }
   let dest=gainNodes[id];
+  // EQ filter chain (use live draft if modal is open for this pad)
+  let eq = slot.drumEQ[id] || null;
+  if (eq && (eq.low !== 0 || eq.mid !== 0 || eq.high !== 0)) {
+    const lo=audioCtx.createBiquadFilter(); lo.type='lowshelf'; lo.frequency.value=EQ_LOW_FREQ; lo.gain.value=eq.low;
+    const md=audioCtx.createBiquadFilter(); md.type='peaking'; md.frequency.value=EQ_MID_FREQ; md.Q.value=EQ_MID_Q; md.gain.value=eq.mid;
+    const hi=audioCtx.createBiquadFilter(); hi.type='highshelf'; hi.frequency.value=EQ_HIGH_FREQ; hi.gain.value=eq.high;
+    lo.connect(md); md.connect(hi); hi.connect(dest); dest=lo;
+  }
   if (effectiveVol!==1.0) { const gainNode=audioCtx.createGain(); gainNode.gain.value=effectiveVol; gainNode.connect(dest); dest=gainNode; }
-  if (cand.buffer) {
+
+  if (needWSola) {
+    // Extract just the trimmed region (+ small margin) for WSOLA processing,
+    // not the full context window which could be the entire source file.
+    const cacheKey = pitchedCacheKey(si, id, semitones, speed) + '_' + ts.toFixed(6) + '_' + te.toFixed(6);
+    let pitchedBuf = _pitchedBufferCache[cacheKey];
+    if (!pitchedBuf) {
+      // Compute absolute time range for the trim region
+      let trimBuf;
+      if (cand.buffer) {
+        const dur = cand.buffer.duration;
+        const sr = cand.buffer.sampleRate, nCh = cand.buffer.numberOfChannels;
+        const s0 = Math.max(0, Math.floor(ts * dur * sr));
+        const s1 = Math.min(cand.buffer.length, Math.ceil(te * dur * sr));
+        const len = s1 - s0; if (len <= 0) return;
+        trimBuf = audioCtx.createBuffer(nCh, len, sr);
+        for (let ch = 0; ch < nCh; ch++) trimBuf.copyToChannel(cand.buffer.getChannelData(ch).subarray(s0, s1), ch);
+      } else {
+        if (!slot.sourceBuffer) return;
+        const sr = slot.sourceBuffer.sampleRate, nCh = slot.sourceBuffer.numberOfChannels;
+        const ctxDur = (cand.ctxEnd || slot.sourceBuffer.duration) - (cand.ctxStart || 0);
+        const absStart = (cand.ctxStart || 0) + ts * ctxDur;
+        const absEnd = (cand.ctxStart || 0) + te * ctxDur;
+        const s0 = Math.max(0, Math.floor(absStart * sr));
+        const s1 = Math.min(slot.sourceBuffer.length, Math.ceil(absEnd * sr));
+        const len = s1 - s0; if (len <= 0) return;
+        trimBuf = audioCtx.createBuffer(nCh, len, sr);
+        for (let ch = 0; ch < nCh; ch++) trimBuf.copyToChannel(slot.sourceBuffer.getChannelData(ch).subarray(s0, s1), ch);
+      }
+      pitchedBuf = renderPitchedBuffer(trimBuf, semitones, speed);
+      _pitchedBufferCache[cacheKey] = pitchedBuf;
+    }
+    src.buffer = pitchedBuf;
+    if (cand.buffer) {
+      src.connect(dest);
+    } else {
+      const normGain = audioCtx.createGain(); normGain.gain.value = cand.normGain ?? 1.0;
+      src.connect(normGain); normGain.connect(dest);
+    }
+    src.start(when);
+  } else if (cand.buffer) {
     src.buffer=cand.buffer; src.connect(dest);
     const dur=cand.buffer.duration;
-    src.start(when,(slot.drumTrimStart[id]??0)*dur,((slot.drumTrimEnd[id]??1)-(slot.drumTrimStart[id]??0))*dur);
+    src.start(when,ts*dur,(te-ts)*dur);
   } else {
     if (!slot.sourceBuffer) return;
     src.buffer=slot.sourceBuffer;
     const normGain=audioCtx.createGain(); normGain.gain.value=cand.normGain??1.0;
     src.connect(normGain); normGain.connect(dest);
     const ctxDur=(cand.ctxEnd||1)-(cand.ctxStart||0);
-    const offset=(cand.ctxStart||0)+(slot.drumTrimStart[id]??0)*ctxDur;
-    const duration=((slot.drumTrimEnd[id]??1)-(slot.drumTrimStart[id]??0))*ctxDur;
+    const offset=(cand.ctxStart||0)+ts*ctxDur;
+    const duration=(te-ts)*ctxDur;
     src.start(when,offset,duration);
   }
 }
 
-function triggerDrumAtTime(slot, id, when) {
+function triggerDrumAtTime(slot, id, when, cellPitch=0) {
   const cands=slot.drumCandidates[id]; if (!cands||!cands.length) return;
   const cand=cands[slot.drumIdx[id]||0]; if (!cand) return;
-  playCandidate(slot,id,cand,when,slot.gridVolume??1.0);
+  playCandidate(slot,id,cand,when,slot.gridVolume??1.0,cellPitch);
 }
 
 function triggerDrum(id) {
@@ -222,6 +409,7 @@ async function openTrimmer(blob, buffer) {
 
 function confirmTrim() {
   if (!trimState) return;
+  if (trimState.mode === 'customClip') { confirmCustomClip(); return; }
   stopTrimPreview();
   const {buffer, trimStart, trimEnd, fileName} = trimState;
   const safeDur = Math.min(trimEnd - trimStart, TRIM_MAX_SECS - 1/buffer.sampleRate);
@@ -292,8 +480,7 @@ async function submitAudio(blob) {
   const analyzeForm=new FormData(); analyzeForm.append('file',blob,'audio');
   const customTexts={};
   slot.activePadIds.forEach(id=>{
-    const el=slot.padInputEls[id];
-    const val=el?el.elt.value.trim():'';
+    const val=(slot.padText[id]||'').trim();
     if(val) customTexts[id]=val;
   });
   analyzeForm.append('custom_texts',JSON.stringify(customTexts));
@@ -311,75 +498,77 @@ async function submitAudio(blob) {
     slot.drumCandidates[id]=[]; slot.drumIdx[id]=0;
     slot.drumTrimStart[id]=0; slot.drumTrimEnd[id]=1;
     if (slot.padMode[id]==='prototype') {
-      const el=slot.padInputEls[id];
-      const protoName=el?el.elt.value.trim():'';
+      const protoName=(slot.padText[id]||'').trim();
       if (protoName && slot.analyzeResults[protoName]) {
         applyPrototype(slot, id, protoName);
       }
     }
   });
   slot.analyzing=false;
-  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+  rebuildKbdMap(); positionSharedInput(); updateElementVisibility();
   if (phase!=='ready') setPhase('ready');
 }
 
 // ── Per-pad recording ────────────────────────────────────────────────────────
 
-async function startPadRecording(id) {
-  const slot=currentSlot();
-  if (slot.padRecording[id]) return;
-  let stream;
-  try { stream=await navigator.mediaDevices.getUserMedia({audio:true,video:false}); }
-  catch(e) { errorMsg='Microphone access denied'; setPhase('error'); return; }
-  const src=audioCtx.createMediaStreamSource(stream);
-  padRecAnalyser=audioCtx.createAnalyser(); padRecAnalyser.fftSize=512;
-  padRecWaveformData=new Uint8Array(padRecAnalyser.frequencyBinCount);
-  src.connect(padRecAnalyser);
-  padRecordingId=id;
-  const chunks=[], recorder=new MediaRecorder(stream);
-  const recState={cancelled:false};
-  recorder.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
-  recorder.onstop=()=>{if(!recState.cancelled)submitPadRecording(slot,id,new Blob(chunks,{type:'audio/webm'}));};
-  recorder.start(100);
-  const limitTimer=setTimeout(()=>{if(slot.padRecording[id])stopPadRecording(id);},10000);
-  slot.padRecorders[id]={mediaRecorder:recorder,chunks,stream,limitTimer,startTime:Date.now(),recState};
-  slot.padRecording[id]=true;
-}
+// ── Custom clip picker ──────────────────────────────────────────────────────
 
-function stopPadRecording(id) {
-  const slot=currentSlot(); const rec=slot.padRecorders[id]; if (!rec) return;
-  const elapsed=Date.now()-rec.startTime;
-  if (elapsed<300) {
-    rec.recState.cancelled=true;
-    errorMsg='Hold the record button longer'; setPhase('error');
-  }
-  clearTimeout(rec.limitTimer); rec.mediaRecorder.stop();
-  rec.stream.getTracks().forEach(t=>t.stop());
-  slot.padRecording[id]=false; slot.padRecorders[id]=null;
-  padRecAnalyser=null; padRecWaveformData=null; padRecordingId=null;
-}
-
-async function submitPadRecording(slot, id, blob) {
-  const form=new FormData();
-  form.append('file',blob,'pad.webm'); form.append('slot_id',id); form.append('top_k','5');
-  try {
-    const resp=await fetch(`${BACKEND}/record-custom`,{method:'POST',body:form});
-    if (!resp.ok) { const e=await resp.json().catch(()=>({detail:resp.statusText})); throw new Error(e.detail||resp.statusText); }
-    const data=await resp.json();
-    const bin=atob(data.audio), bytes=new Uint8Array(bin.length);
-    for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
-    const buf=await audioCtx.decodeAudioData(bytes.buffer.slice(0));
-    slot.drumCandidates[id]=[{buffer:buf,score:1.0,time:0}];
-    slot.drumIdx[id]=0; slot.drumTrimStart[id]=0; slot.drumTrimEnd[id]=1;
-    slot.padRecLabels[id]=data.labels;
-    if (data.labels&&data.labels.length>0) {
-      const el=slot.padInputEls[id];
-      if (el) el.elt.value=data.labels[0].term;
+function openCustomClipPicker(slot, padId) {
+  if (!slot.sourceBuffer) return;
+  const buffer = slot.sourceBuffer;
+  // If the pad already has a mapped sound, open the trimmer on that region
+  let initStart = 0, initEnd = Math.min(buffer.duration, 2);
+  const cands = slot.drumCandidates[padId];
+  if (cands && cands.length > 0) {
+    const cand = cands[slot.drumIdx[padId] || 0];
+    const ts = slot.drumTrimStart[padId] ?? cand.trimStart ?? 0;
+    const te = slot.drumTrimEnd[padId] ?? cand.trimEnd ?? 1;
+    if (cand.ctxStart != null && cand.ctxEnd != null) {
+      const ctxDur = cand.ctxEnd - cand.ctxStart;
+      initStart = cand.ctxStart + ts * ctxDur;
+      initEnd = cand.ctxStart + te * ctxDur;
+    } else if (cand.buffer) {
+      initStart = ts * cand.buffer.duration;
+      initEnd = te * cand.buffer.duration;
     }
-    slot.padFinalized[id]=true; slot.padMode[id]='record';
-    positionPadInputs();
-    padFlash[id]=millis(); triggerDrum(id);
-  } catch(e) { errorMsg=e.message; setPhase('error'); }
+  }
+  trimState = {
+    buffer,
+    fileName: slot.fileName || 'source audio',
+    trimStart: initStart,
+    trimEnd: initEnd,
+    wfPeaks: computeWfPeaks(buffer, 600),
+    dragging: null,
+    mode: 'customClip',
+    padId,
+  };
+  setPhase('trimming');
+}
+
+function confirmCustomClip() {
+  if (!trimState || trimState.mode !== 'customClip') return;
+  stopTrimPreview();
+  const { padId, trimStart, trimEnd } = trimState;
+  const slot = currentSlot();
+  slot.drumCandidates[padId] = [{
+    ctxStart: trimStart,
+    ctxEnd: trimEnd,
+    trimStart: 0,
+    trimEnd: 1,
+    score: 1.0,
+    time: trimStart,
+  }];
+  slot.drumIdx[padId] = 0;
+  slot.drumTrimStart[padId] = 0;
+  slot.drumTrimEnd[padId] = 1;
+  slot.padMode[padId] = 'custom';
+  slot.padFinalized[padId] = true;
+  slot.padText[padId] = trimStart.toFixed(1) + '\u2013' + trimEnd.toFixed(1) + 's';
+  trimState = null;
+  setPhase('ready');
+  syncSharedInput(); positionSharedInput();
+  padFlash[padId] = millis();
+  triggerDrum(padId);
 }
 
 // ── Live CLAP re-query ───────────────────────────────────────────────────────
@@ -388,8 +577,7 @@ let _clapQueryTimers={};
 function queryClapLive(slot, id) {
   clearTimeout(_clapQueryTimers[id]);
   _clapQueryTimers[id]=setTimeout(async()=>{
-    const el=slot.padInputEls[id];
-    const text=el?el.elt.value.trim():'';
+    const text=(slot.padText[id]||'').trim();
     if (!text) return;
     // Wait for analysis to finish if still in progress
     if (!slot.sessionId && slot.analyzing) {
@@ -406,11 +594,12 @@ function queryClapLive(slot, id) {
       const resp=await fetch(`${BACKEND}/query-custom`,{method:'POST',body:form});
       if (!resp.ok) return;
       const data=await resp.json();
-      const decoded=data.candidates.map(c=>({
+      const sourceDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
+      const decoded=data.candidates.map(c=> widenCandidateContext({
         ctxStart:c.ctx_start_s, ctxEnd:c.ctx_end_s,
         trimStart:c.trim_start??0, trimEnd:c.trim_end??1,
         normGain:c.norm_gain??1.0, score:c.score, time:c.time,
-      }));
+      }, sourceDur));
       if (decoded.length>0) {
         slot.drumCandidates[id]=decoded; slot.drumIdx[id]=0;
         slot.drumTrimStart[id]=decoded[0].trimStart; slot.drumTrimEnd[id]=decoded[0].trimEnd;
@@ -437,9 +626,19 @@ function mergeWordBuffers(slot, words) {
   return out;
 }
 
+function lyricsContextCandidate(slot, startTime, endTime) {
+  if (!slot.sourceBuffer) return null;
+  const dur = slot.sourceBuffer.duration;
+  // Use full source buffer as context — trim fractions locate the actual clip
+  const ctxStart = 0;
+  const ctxEnd = dur;
+  const trimStart = startTime / dur;
+  const trimEnd = (endTime + LYRIC_POST_ROLL) / dur;
+  return { ctxStart, ctxEnd, trimStart, trimEnd, normGain: 1.0, score: 1.0, time: startTime };
+}
+
 function applyLyricsQuery(slot, id) {
-  const el=slot.padInputEls[id];
-  const raw=el?el.elt.value.trim():'';
+  const raw=(slot.padText[id]||'').trim();
   const query=raw.toLowerCase().replace(/[.,!?;:'"()\-\u2014\u2013]/g,'').trim();
   if (!query) { slot.drumCandidates[id]=[]; slot.drumIdx[id]=0; return; }
   if (slot.lyricsTranscript.length===0) { slot.drumCandidates[id]=[]; slot.drumIdx[id]=0; return; }
@@ -452,12 +651,16 @@ function applyLyricsQuery(slot, id) {
   }
   const candidates=hits.slice(0,N_CANDIDATES), decoded=[];
   for (const hit of candidates) {
-    const buf=mergeWordBuffers(slot,hit.words);
-    if (buf) decoded.push({buffer:buf,score:1.0,time:hit.start,trimStart:0,trimEnd:1});
+    const cand = lyricsContextCandidate(slot, hit.start, hit.end);
+    if (cand) decoded.push(cand);
   }
   slot.drumCandidates[id]=decoded; slot.drumIdx[id]=0;
-  slot.drumTrimStart[id]=0; slot.drumTrimEnd[id]=1;
-  if (decoded.length>0) padFlash[id]=millis();
+  if (decoded.length>0) {
+    slot.drumTrimStart[id]=decoded[0].trimStart; slot.drumTrimEnd[id]=decoded[0].trimEnd;
+    padFlash[id]=millis();
+  } else {
+    slot.drumTrimStart[id]=0; slot.drumTrimEnd[id]=1;
+  }
 }
 
 // ── Prototype assignment ─────────────────────────────────────────────────────
@@ -465,21 +668,21 @@ function applyLyricsQuery(slot, id) {
 function applyPrototype(slot, padId, prototypeName, silent=false) {
   const results = slot.analyzeResults[prototypeName];
   if (!results || !results.candidates || results.candidates.length === 0) return;
-  const candidates = results.candidates.map(c => ({
+  const sourceDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
+  const candidates = results.candidates.map(c => widenCandidateContext({
     ctxStart: c.ctx_start_s, ctxEnd: c.ctx_end_s,
     trimStart: c.trim_start ?? 0, trimEnd: c.trim_end ?? 1,
     normGain: c.norm_gain ?? 1.0, score: c.score, time: c.time,
-  }));
+  }, sourceDur));
   slot.drumCandidates[padId] = candidates;
   slot.drumIdx[padId] = 0;
   slot.drumTrimStart[padId] = candidates[0].trimStart;
   slot.drumTrimEnd[padId] = candidates[0].trimEnd;
-  const el = slot.padInputEls[padId];
-  if (el) el.elt.value = prototypeName;
+  slot.padText[padId] = prototypeName;
   slot.padFinalized[padId] = true;
   slot.padMode[padId] = 'prototype';
   slot.padMenuOpen[padId] = false;
-  positionPadInputs();
+  syncSharedInput(); positionSharedInput();
   if (!silent) { padFlash[padId] = millis(); triggerDrum(padId); }
 }
 
@@ -507,6 +710,9 @@ async function saveSession() {
         steps: slot.grid.steps,
         measures: slot.grid.measures.map(m => ({
           cells: Object.fromEntries(Object.entries(m.cells).map(([k, v]) => [k, [...v]])),
+          cellPitch: m.cellPitch
+            ? Object.fromEntries(Object.entries(m.cellPitch).map(([k, v]) => [k, [...v]]))
+            : undefined,
         })),
       },
       gridVolume: slot.gridVolume ?? 1.0,
@@ -534,17 +740,19 @@ async function saveSession() {
 
     // Save pad state
     for (const id of slot.activePadIds) {
-      const el = slot.padInputEls[id];
       const padData = {
         mode: slot.padMode[id] || null,
         finalized: !!slot.padFinalized[id],
-        inputText: el ? el.elt.value : '',
+        inputText: slot.padText[id] || '',
         volume: slot.drumVolumes[id] ?? 0.8,
         pitch: slot.drumPitch[id] ?? 0,
         trimStart: slot.drumTrimStart[id] ?? 0,
         trimEnd: slot.drumTrimEnd[id] ?? 1,
+        eq: slot.drumEQ[id] || { low: 0, mid: 0, high: 0 },
+        speed: slot.drumSpeed[id] ?? 1.0,
+        pitchSpeedLinked: slot.drumPitchSpeedLinked[id] ?? true,
         candidateIdx: slot.drumIdx[id] ?? 0,
-        recLabels: slot.padRecLabels[id] || [],
+        recLabels: [],
         recordWavPath: null,
       };
 
@@ -665,9 +873,12 @@ async function loadSession() {
     if (sd.grid.measures) {
       slot.grid.measures = sd.grid.measures.map(m => ({
         cells: Object.fromEntries(Object.entries(m.cells).map(([k, v]) => [k, [...v]])),
+        cellPitch: m.cellPitch
+          ? Object.fromEntries(Object.entries(m.cellPitch).map(([k, v]) => [k, [...v]]))
+          : {},
       }));
     } else if (sd.grid.cells) {
-      slot.grid.measures = [{ cells: Object.fromEntries(Object.entries(sd.grid.cells).map(([k, v]) => [k, [...v]])) }];
+      slot.grid.measures = [{ cells: Object.fromEntries(Object.entries(sd.grid.cells).map(([k, v]) => [k, [...v]])), cellPitch: {} }];
     }
     slot.grid.editMeasure = 0;
 
@@ -688,17 +899,18 @@ async function loadSession() {
       slot.padFinalized[id] = pd.finalized;
       slot.drumVolumes[id] = pd.volume;
       slot.drumPitch[id] = pd.pitch;
-      slot.drumTrimStart[id] = pd.trimStart;
-      slot.drumTrimEnd[id] = pd.trimEnd;
+      const sDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
+      const { ts: remappedTs, te: remappedTe } = remapSavedTrim(pd, sDur);
+      slot.drumTrimStart[id] = remappedTs;
+      slot.drumTrimEnd[id] = remappedTe;
+      slot.drumEQ[id] = pd.eq || { low: 0, mid: 0, high: 0 };
+      slot.drumSpeed[id] = pd.speed ?? 1.0;
+      // Backward compat: old files have preserveTempo; convert to unlinked
+      slot.drumPitchSpeedLinked[id] = pd.pitchSpeedLinked ?? (pd.preserveTempo ? false : true);
       slot.drumIdx[id] = pd.candidateIdx;
-      slot.padRecLabels[id] = pd.recLabels || [];
 
       _addPadToSlot(slot, def);
-      const el = slot.padInputEls[id];
-      if (el) {
-        el.elt.value = pd.inputText || '';
-        if (pd.finalized) el.elt.readOnly = true;
-      }
+      slot.padText[id] = pd.inputText || '';
 
       // Restore saved candidates immediately (enables playback before analysis)
       if (pd.mode === 'record' && pd.recordWavPath) {
@@ -706,25 +918,27 @@ async function loadSession() {
         const buf = await audioCtx.decodeAudioData(padWav.slice(0));
         slot.drumCandidates[id] = [{ buffer: buf, score: 1.0, time: 0, trimStart: 0, trimEnd: 1 }];
       } else if (pd.candidates && pd.candidates.length > 0) {
-        slot.drumCandidates[id] = pd.candidates.map(c => ({
+        const sDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
+        slot.drumCandidates[id] = pd.candidates.map(c => widenCandidateContext({
           ctxStart: c.ctxStart, ctxEnd: c.ctxEnd,
           trimStart: c.trimStart, trimEnd: c.trimEnd,
           normGain: c.normGain, score: c.score, time: c.time,
-        }));
+        }, sDur));
       }
     }
 
+    ensureAllPads(slot);
     loadedSlots.push(slot);
   }
 
-  // Remove placeholder and swap in loaded slots
-  Object.values(slots[0].padInputEls).forEach(w => w.elt.remove());
+  // Swap in loaded slots
   slots = loadedSlots.length > 0 ? loadedSlots : [createSlot()];
   _nextSteps = slots.map(() => 0);
   selectedSlotIdx = Math.min(manifest.selectedSlotIdx ?? 0, slots.length - 1);
+  selectedPadId = currentSlot().activePadIds[0] || null;
   // Mark slots for re-analysis before updating visibility
   slots.forEach(slot => { if (slot.sourceBuffer) slot.analyzing = true; });
-  rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+  syncSharedInput(); rebuildKbdMap(); positionSharedInput(); updateElementVisibility();
 
   // Re-analyze slots that have source audio (async, parallel)
   slots.forEach((slot, si) => {
@@ -742,8 +956,16 @@ async function loadSession() {
         const pd = sd.pads[id];
         if (pd && pd.mode === 'lyrics') {
           applyLyricsQuery(slot, id);
-          slot.drumTrimStart[id] = pd.trimStart;
-          slot.drumTrimEnd[id] = pd.trimEnd;
+          // Only restore saved trim if candidates have ctxStart (new format);
+          // old files saved trimStart=0/trimEnd=1 for standalone buffers — let
+          // applyLyricsQuery's context-aware trim values stand instead.
+          const savedCands = pd.candidates;
+          if (savedCands && savedCands.length > 0 && savedCands[0].ctxStart != null) {
+            const sDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
+            const { ts, te } = remapSavedTrim(pd, sDur);
+            slot.drumTrimStart[id] = ts;
+            slot.drumTrimEnd[id] = te;
+          }
           slot.drumIdx[id] = pd.candidateIdx;
         }
       });
@@ -761,8 +983,13 @@ async function loadSession() {
             const pd = sd.pads[id];
             if (pd && pd.mode === 'lyrics') {
               applyLyricsQuery(slot, id);
-              slot.drumTrimStart[id] = pd.trimStart;
-              slot.drumTrimEnd[id] = pd.trimEnd;
+              const savedCands = pd.candidates;
+              if (savedCands && savedCands.length > 0 && savedCands[0].ctxStart != null) {
+                const sDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
+                const { ts, te } = remapSavedTrim(pd, sDur);
+                slot.drumTrimStart[id] = ts;
+                slot.drumTrimEnd[id] = te;
+              }
               slot.drumIdx[id] = pd.candidateIdx;
             }
           });
@@ -791,28 +1018,32 @@ async function loadSession() {
             const protoName = pd.inputText;
             if (protoName && slot.analyzeResults[protoName]) {
               applyPrototype(slot, id, protoName, true);
-              slot.drumTrimStart[id] = pd.trimStart;
-              slot.drumTrimEnd[id] = pd.trimEnd;
+              const sDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
+              const { ts, te } = remapSavedTrim(pd, sDur);
+              slot.drumTrimStart[id] = ts;
+              slot.drumTrimEnd[id] = te;
               slot.drumIdx[id] = pd.candidateIdx;
             }
           } else if (!pd.mode && pd.inputText) {
             // Custom CLAP text query pad — results come back keyed by pad ID
             const results = slot.analyzeResults[id];
             if (results && results.candidates && results.candidates.length > 0) {
-              const candidates = results.candidates.map(c => ({
+              const sDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
+              const candidates = results.candidates.map(c => widenCandidateContext({
                 ctxStart: c.ctx_start_s, ctxEnd: c.ctx_end_s,
                 trimStart: c.trim_start ?? 0, trimEnd: c.trim_end ?? 1,
                 normGain: c.norm_gain ?? 1.0, score: c.score, time: c.time,
-              }));
+              }, sDur));
               slot.drumCandidates[id] = candidates;
               slot.drumIdx[id] = pd.candidateIdx;
-              slot.drumTrimStart[id] = pd.trimStart;
-              slot.drumTrimEnd[id] = pd.trimEnd;
+              const { ts, te } = remapSavedTrim(pd, sDur);
+              slot.drumTrimStart[id] = ts;
+              slot.drumTrimEnd[id] = te;
             }
           }
         });
         slot.analyzing = false;
-        rebuildKbdMap(); positionPadInputs(); updateElementVisibility();
+        rebuildKbdMap(); positionSharedInput(); updateElementVisibility();
       })
       .catch(e => {
         console.warn('[load:analyze] failed:', e);

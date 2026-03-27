@@ -3,20 +3,16 @@
 // ── p5 lifecycle ─────────────────────────────────────────────────────────────
 
 let logoImg;
-let _fontsReady = false;
 function preload() {
   logoImg = loadImage('boxer-logo.png');
-  Promise.all([
-    document.fonts.load("16px 'Silkscreen'"),
-    document.fonts.load("bold 16px 'Silkscreen'"),
-  ]).then(() => { _fontsReady = true; });
+  _fontsReady = true;
 }
 
 function setup() {
   window.addEventListener('beforeunload', e => { e.preventDefault(); });
   createCanvas(max(windowWidth, MIN_WIDTH), windowHeight);
   colorMode(HSB, 360, 100, 100, 100);
-  textFont('Silkscreen');
+  textFont(_debugFont);
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   uploadEl = select('#upload-input');
   uploadEl.changed(onFileSelected);
@@ -47,14 +43,187 @@ function setup() {
   chipsContainer.id = 'picker-chips'; chipsContainer.style.cssText = 'display:flex;flex-wrap:wrap;gap:0;user-select:none;';
   pickerEl.appendChild(chipsContainer); document.body.appendChild(pickerEl);
 
+  // Shared pad text input
+  _sharedInputEl = document.createElement('input');
+  _sharedInputEl.type = 'text';
+  _sharedInputEl.className = 'pad-input';
+  _sharedInputEl.style.cssText = [
+    'position:fixed','z-index:50','border:none','outline:none','background:transparent',
+    `font-family:'${_debugFont}',monospace`,'padding:0 2px','display:none',
+  ].join(';');
+  _sharedInputEl.addEventListener('input', () => {
+    const slot = currentSlot();
+    if (!selectedPadId) return;
+    slot.padText[selectedPadId] = _sharedInputEl.value;
+  });
+  _sharedInputEl.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      const slot = currentSlot();
+      if (selectedPadId && _sharedInputEl.value.trim()) {
+        slot.padText[selectedPadId] = _sharedInputEl.value;
+        slot.padFinalized[selectedPadId] = true;
+        const mode = slot.padMode[selectedPadId];
+        if (mode === 'lyrics') applyLyricsQuery(slot, selectedPadId);
+        else queryClapLive(slot, selectedPadId);
+        syncSharedInput(); positionSharedInput();
+      }
+      _sharedInputEl.blur(); e.preventDefault();
+    }
+    if (e.key === 'Escape') { _sharedInputEl.blur(); e.preventDefault(); }
+  });
+  document.body.appendChild(_sharedInputEl);
+
+  // Override textSize to apply debug font size offset
+  const _origTextSize = window.textSize;
+  window.textSize = function(s) { _origTextSize(s + _debugFontSize); };
+
   _nextSteps = [0];
+  ensureAllPads(currentSlot());
+  selectedPadId = currentSlot().activePadIds[0] || null;
   fetch(`${BACKEND}/prototypes`).then(r=>r.json()).then(d=>{availablePrototypes=d.prototypes||[];}).catch(()=>{});
-  positionPadInputs(); updateElementVisibility();
+  // _createDebugPanel(); // debug panel disabled — uncomment to re-enable (backtick to toggle)
+  syncSharedInput(); positionSharedInput(); updateElementVisibility();
+}
+
+function _createDebugPanel() {
+  const panel = document.createElement('div');
+  panel.id = 'debug-panel';
+  panel.style.cssText = [
+    'position:fixed','top:0','right:0','z-index:9999','display:none',
+    'background:rgba(30,30,30,0.95)','color:#ccc','padding:10px 14px',
+    "font-family:'IBM Plex Mono',monospace",'font-size:11px',
+    'width:240px','max-height:100vh','overflow-y:auto',
+    'border-left:1px solid #555','user-select:none',
+  ].join(';');
+
+  const colorDefs = [
+    ['BG', BG], ['PANEL', PANEL], ['CTRL_PANEL', CTRL_PANEL],
+    ['SEQ_CELL', SEQ_CELL], ['SEQ_CELL_ALT', SEQ_CELL_ALT],
+    ['INK', INK], ['INK_DIM', INK_DIM],
+    ['INK_FAINT', INK_FAINT], ['ACCENT', ACCENT], ['SELECTED_HDR', SELECTED_HDR],
+  ];
+  const scalarDefs = [
+    ['DRUM_S', () => DRUM_S, v => { DRUM_S = v; _palette.DRUM_S = v; }, 0, 100],
+    ['DRUM_B', () => DRUM_B, v => { DRUM_B = v; _palette.DRUM_B = v; }, 0, 100],
+    ['DRUM_S_LITE', () => DRUM_S_LITE, v => { DRUM_S_LITE = v; _palette.DRUM_S_LITE = v; }, 0, 100],
+    ['DRUM_B_LITE', () => DRUM_B_LITE, v => { DRUM_B_LITE = v; _palette.DRUM_B_LITE = v; }, 0, 100],
+  ];
+
+  let html = '<div style="font-size:13px;font-weight:bold;margin-bottom:8px">Debug: Colors</div>';
+
+  colorDefs.forEach(([name, arr]) => {
+    html += `<div style="margin-bottom:6px"><label style="display:block;margin-bottom:2px">${name}</label>`;
+    ['H','S','B'].forEach((ch, ci) => {
+      const max = ci === 0 ? 360 : 100;
+      html += `<span style="font-size:9px;width:12px;display:inline-block">${ch}</span>`;
+      html += `<input type="range" min="0" max="${max}" value="${arr[ci]}" data-color="${name}" data-idx="${ci}" style="width:140px;vertical-align:middle">`;
+      html += `<span class="dbg-val" data-color="${name}" data-idx="${ci}" style="font-size:9px;width:28px;display:inline-block;text-align:right">${arr[ci]}</span><br>`;
+    });
+    html += '</div>';
+  });
+
+  html += '<div style="margin-top:8px;border-top:1px solid #555;padding-top:8px">';
+  scalarDefs.forEach(([name,,, mn, mx]) => {
+    const val = name === 'DRUM_S' ? DRUM_S : name === 'DRUM_B' ? DRUM_B : name === 'DRUM_S_LITE' ? DRUM_S_LITE : DRUM_B_LITE;
+    html += `<label style="font-size:10px">${name}</label> `;
+    html += `<input type="range" min="${mn}" max="${mx}" value="${val}" data-scalar="${name}" style="width:120px;vertical-align:middle">`;
+    html += `<span class="dbg-val" data-scalar="${name}" style="font-size:9px;width:28px;display:inline-block;text-align:right">${val}</span><br>`;
+  });
+  html += '</div>';
+
+  html += '<div style="margin-top:8px;border-top:1px solid #555;padding-top:8px">';
+  html += '<label style="font-size:10px">Font</label> ';
+  html += '<select id="dbg-font" style="font-size:10px;width:150px;background:#222;color:#ccc;border:1px solid #555">';
+  ['Silkscreen','IBM Plex Mono','monospace','Inter','Arial','Courier New','Georgia',
+   'Futura','Helvetica Neue','Palatino','Baskerville','Didot','Optima','Gill Sans',
+   'American Typewriter','Copperplate','Papyrus','Marker Felt','Chalkduster',
+   'Snell Roundhand','Phosphate','Herculanum','Trattatello','Party LET',
+   'Menlo','Monaco','Andale Mono','Bradley Hand','Brush Script MT',
+   'Comic Sans MS','Impact','Luminari','Zapfino',
+   'Avenir','Avenir Next Condensed','DIN Alternate','Rockwell',
+  ].forEach(f => {
+    html += `<option value="${f}" ${f===_debugFont?'selected':''}>${f}</option>`;
+  });
+  html += '</select><br>';
+  html += '<label style="font-size:10px">Size offset</label> ';
+  html += `<input type="range" id="dbg-fontsize" min="-4" max="8" value="${_debugFontSize}" style="width:120px;vertical-align:middle">`;
+  html += `<span id="dbg-fontsize-val" style="font-size:9px">${_debugFontSize}</span>`;
+  html += '</div>';
+
+  html += '<div style="margin-top:8px;text-align:right"><button id="dbg-reset" style="font-size:10px;background:#444;color:#ccc;border:1px solid #666;padding:2px 8px;cursor:pointer">Reset</button></div>';
+
+  panel.innerHTML = html;
+  document.body.appendChild(panel);
+
+  // Wire color sliders
+  const colorArrays = { BG, PANEL, CTRL_PANEL, SEQ_CELL, SEQ_CELL_ALT, INK, INK_DIM, INK_FAINT, ACCENT, SELECTED_HDR };
+  panel.addEventListener('input', e => {
+    const el = e.target;
+    if (el.dataset.color) {
+      const arr = colorArrays[el.dataset.color];
+      const idx = parseInt(el.dataset.idx);
+      arr[idx] = parseInt(el.value);
+      _palette[el.dataset.color][idx] = arr[idx];
+      const valSpan = panel.querySelector(`.dbg-val[data-color="${el.dataset.color}"][data-idx="${idx}"]`);
+      if (valSpan) valSpan.textContent = el.value;
+    }
+    if (el.dataset.scalar) {
+      const v = parseInt(el.value);
+      const s = scalarDefs.find(d => d[0] === el.dataset.scalar);
+      if (s) s[2](v);
+      const valSpan = panel.querySelector(`.dbg-val[data-scalar="${el.dataset.scalar}"]`);
+      if (valSpan) valSpan.textContent = v;
+    }
+    if (el.id === 'dbg-fontsize') {
+      _debugFontSize = parseInt(el.value);
+      document.getElementById('dbg-fontsize-val').textContent = _debugFontSize;
+    }
+  });
+  panel.addEventListener('change', e => {
+    if (e.target.id === 'dbg-font') {
+      _debugFont = e.target.value;
+      textFont(_debugFont);
+      if (_sharedInputEl) _sharedInputEl.style.fontFamily = `'${_debugFont}', monospace`;
+    }
+  });
+  panel.querySelector('#dbg-reset').addEventListener('click', () => {
+    Object.entries(_palette).forEach(([k, v]) => {
+      if (Array.isArray(v) && colorArrays[k]) {
+        v.forEach((c, i) => { colorArrays[k][i] = c; });
+        panel.querySelectorAll(`[data-color="${k}"]`).forEach(el => {
+          const idx = parseInt(el.dataset?.idx ?? el.getAttribute('data-idx'));
+          if (!isNaN(idx)) { if (el.tagName === 'INPUT') el.value = v[idx]; else el.textContent = v[idx]; }
+        });
+      }
+    });
+    DRUM_S = _palette.DRUM_S; DRUM_B = _palette.DRUM_B;
+    DRUM_S_LITE = _palette.DRUM_S_LITE; DRUM_B_LITE = _palette.DRUM_B_LITE;
+    scalarDefs.forEach(([name]) => {
+      const el = panel.querySelector(`[data-scalar="${name}"]`);
+      const vSpan = panel.querySelector(`.dbg-val[data-scalar="${name}"]`);
+      const val = _palette[name];
+      if (el) el.value = val;
+      if (vSpan) vSpan.textContent = val;
+    });
+    _debugFont = 'Gill Sans'; _debugFontSize = 2;
+    textFont('Gill Sans');
+    if (_sharedInputEl) _sharedInputEl.style.fontFamily = "'Gill Sans', monospace";
+    const fontSel = document.getElementById('dbg-font');
+    if (fontSel) fontSel.value = 'Gill Sans';
+    const fsEl = document.getElementById('dbg-fontsize');
+    if (fsEl) fsEl.value = 0;
+    const fsVal = document.getElementById('dbg-fontsize-val');
+    if (fsVal) fsVal.textContent = '0';
+  });
+  // Stop keyboard events from reaching p5
+  panel.addEventListener('keydown', e => e.stopPropagation());
+  panel.addEventListener('keyup', e => e.stopPropagation());
 }
 
 function windowResized() {
   resizeCanvas(max(windowWidth, MIN_WIDTH), windowHeight);
-  positionPadInputs(); updateElementVisibility();
+  positionSharedInput(); updateElementVisibility();
 }
 
 
@@ -80,13 +249,19 @@ function onSlotHeaderClick() {
     const volHandleX=L.volSliderX+(slot.gridVolume??1.0)*L.volSliderW;
     const swingHandleX=L.swingSliderX+(slot.swing??0)*L.swingSliderW;
     const humHandleX=L.humSliderX+(slot.humanize??0)*L.humSliderW;
-    // Capsule buttons: C D S M
-    if (mX()>=L.capsuleX&&mX()<L.capsuleX+L.capsuleCellW*4) {
+    // CLR standalone button
+    if (mX()>=L.clrX&&mX()<L.clrX+L.standaloneW&&abs(screenMid-mY())<L.btnH/2+2) {
+      const ec=editCells(slots[slotIndex]); getActivePads(slots[slotIndex]).forEach(drum=>{if(ec[drum.id])ec[drum.id].fill(false);}); return true;
+    }
+    // DUP standalone button
+    if (mX()>=L.dupX&&mX()<L.dupX+L.standaloneW&&abs(screenMid-mY())<L.btnH/2+2) {
+      duplicateSlot(slotIndex); return true;
+    }
+    // Capsule buttons: S M
+    if (mX()>=L.capsuleX&&mX()<L.capsuleX+L.capsuleCellW*2) {
       const cellIdx=Math.floor((mX()-L.capsuleX)/L.capsuleCellW);
-      if (cellIdx===0) { const ec=editCells(slots[slotIndex]); getActivePads(slots[slotIndex]).forEach(drum=>{if(ec[drum.id])ec[drum.id].fill(false);}); return true; }
-      if (cellIdx===1) { duplicateSlot(slotIndex); return true; }
-      if (cellIdx===2) { slot.soloed=!slot.soloed; return true; }
-      if (cellIdx===3) { slot.muted=!slot.muted; return true; }
+      if (cellIdx===0) { slot.soloed=!slot.soloed; return true; }
+      if (cellIdx===1) { slot.muted=!slot.muted; return true; }
     }
     // Remove slot (X) button
     if (slots.length>1&&mX()>=L.removeX&&mX()<L.removeX+L.removeW) { removeSlot(slotIndex); return true; }
@@ -116,6 +291,7 @@ function onSlotHeaderClick() {
         const tx=L.measureTabsX+i*L.measureTabW;
         if (mX()>=tx&&mX()<tx+L.measureTabW&&effY>=tabY&&effY<tabY+tabH) {
           selectSlot(slotIndex);
+          globalEditMeasure=i;
           slot.grid.editMeasure=i;
           drag={type:'reorderMeasure',slotIndex,fromIdx:i,startX:mX()};
           return true;
@@ -159,7 +335,7 @@ function onSlotHeaderClick() {
 function onSeqControlsClick() {
   const {seqRowHeight,ctrlY,gridTop,seqW}=getSeqLayout();
   const ctrlMid=ctrlY+SEQ_CTRL_H/2;
-  const playX=SEQ_MARGIN+SEQ_LABEL_W;
+  const playX=SEQ_MARGIN+12+12;
   const recBtnX=playX+12*2+16;
   if (dist(mX(),mY(),playX,ctrlMid)<12) { seqPlaying?stopSequencer():startSequencer(); return true; }
   if (dist(mX(),mY(),recBtnX,ctrlMid)<9) { if (!seqPlaying) startSequencer(); seqRecording=!seqRecording; if (seqRecording) scheduleMetronomeClick(_loopStartTime,true); return true; }
@@ -168,15 +344,11 @@ function onSeqControlsClick() {
   if (abs(mX()-thumbX)<10&&abs(mY()-ctrlMid)<10) { drag={type:'bpm',sliderX:bpmSliderX,sliderW:100}; return true; }
   const tapX=bpmSliderX+100+36, tapW=34, tapH=20;
   if (mX()>tapX&&mX()<tapX+tapW&&mY()>ctrlMid-tapH/2&&mY()<ctrlMid+tapH/2) { handleTap(); return true; }
-  const clrAllX=tapX+tapW+10, clrAllW=50, clrAllH=20;
-  if (mX()>clrAllX&&mX()<clrAllX+clrAllW&&mY()>ctrlMid-clrAllH/2&&mY()<ctrlMid+clrAllH/2) {
-    const slot=currentSlot(), ec=editCells(slot); getActivePads(slot).forEach(drum=>{if(ec[drum.id])ec[drum.id].fill(false);}); return true;
-  }
   // Global measure tabs + padlock
   {
     const maxM=Math.max(...slots.map(s=>s.grid.measures.length));
     if (maxM>=1) {
-      const tw=12, tabH=10, lockW=14;
+      const tw=16, tabH=14, lockW=14;
       const totalW=maxM*tw+lockW;
       const baseX=cW()-SEQ_MARGIN-8-totalW-(seqRecording?42:0);
       const tabY=ctrlMid-tabH/2;
@@ -207,6 +379,32 @@ function onSeqControlsClick() {
   return false;
 }
 
+// ── Sequencer label click handler ────────────────────────────────────────────
+
+function onSeqLabelClick() {
+  const {seqRowHeight,gridTop,gridLeft}=getSeqLayout();
+  if (mX()>gridLeft || mX()<SEQ_MARGIN || mY()<gridTop) return false;
+  const effY=mY()+seqScrollY;
+  for (let slotIndex=0; slotIndex<slots.length; slotIndex++) {
+    const slot=slots[slotIndex];
+    const seqDrums=getSeqPads(slot), numSeqRows=seqDrums.length;
+    const slotGridTopY=getSlotGridTop(slotIndex,gridTop,seqRowHeight);
+    if (effY<slotGridTopY||effY>slotGridTopY+numSeqRows*seqRowHeight) continue;
+    for (let rowIndex=0; rowIndex<seqDrums.length; rowIndex++) {
+      const rowY=slotGridTopY+rowIndex*seqRowHeight;
+      if (effY>=rowY&&effY<rowY+seqRowHeight) {
+        const drum=seqDrums[rowIndex];
+        selectSlot(slotIndex);
+        selectPad(drum.id);
+        drag={type:'reorderSeqLabel', slotIdx:slotIndex, padId:drum.id, seqRowIdx:rowIndex,
+              startX:mX(), startY:mY(), currentX:mX(), currentY:mY(), triggered:false};
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // ── Sequencer cell click handler ─────────────────────────────────────────────
 
 function onSeqCellsClick() {
@@ -228,7 +426,17 @@ function onSeqCellsClick() {
         selectSlot(slotIndex);
         const ec=editCells(slot);
         if (!ec[drum.id]) ec[drum.id]=new Array(grid.steps).fill(false);
-        const newVal=!ec[drum.id][stepIdx];
+        const isOn=ec[drum.id][stepIdx];
+        // Check for pitch icon click: right 30% of an ON cell with cellW >= 14
+        const cx0=gridLeft+stepPositions[stepIdx]*seqW, cx1=gridLeft+stepPositions[stepIdx+1]*seqW;
+        const cellW=cx1-cx0;
+        if (isOn && cellW >= 14 && (mX() - cx0) > cellW * 0.7) {
+          const ecp=editCellPitch(slot);
+          const curPitch=(ecp[drum.id]&&ecp[drum.id][stepIdx])||0;
+          cellPitchDropdown={slotIdx:slotIndex,padId:drum.id,stepIdx,x:cx0,y:rowY-seqScrollY,cellW,cellH:seqRowHeight,currentPitch:curPitch};
+          return;
+        }
+        const newVal=!isOn;
         ec[drum.id][stepIdx]=newVal;
         if (newVal && !seqPlaying) triggerDrumAtTime(slot, drum.id, audioCtx.currentTime);
         drag={type:'seqPaint',slotIdx:slotIndex,drumId:drum.id,seqW,gridLeft,gTop:slotGridTopY,seqRowHeight,rowIndex,value:newVal,lastS:stepIdx};
@@ -237,168 +445,290 @@ function onSeqCellsClick() {
   });
 }
 
-// ── Pad interaction handler ──────────────────────────────────────────────────
+// ── Key grid click handler ───────────────────────────────────────────────────
 
-/** Handle trim bar, dials, swap button, and eye icon — shared by all pads. Returns true if handled. */
-function onPadControlInteract(drum, x, y, padW) {
-  const slot=currentSlot();
-  const hasCandidates=slot.drumCandidates[drum.id]&&slot.drumCandidates[drum.id].length>0;
-  const tb=trimBarRect(x,y,padW), swp=swapBtnRect(x,y,padW);
-  if (hasCandidates&&mY()>tb.y&&mY()<tb.y+tb.h) {
-    const dLeft=abs(mX()-tb.x), dRight=abs(mX()-(tb.x+tb.w));
-    // Hit zone: 10px from either edge of the bar
-    if (dLeft<10||dRight<10) {
-      const which=dRight<=dLeft?'trimEnd':'trimStart';
-      const ts=slot.drumTrimStart[drum.id]||0, te=slot.drumTrimEnd[drum.id]??1;
-      drag={type:which,id:drum.id,slotIdx:selectedSlotIdx,barX:tb.x,barW:tb.w,
-            origStart:ts,origEnd:te,proposedStart:ts,proposedEnd:te}; return true;
-    }
-  }
-  const volDial=dialCenter(x,y,padW,PAD_H+LYRICS_STRIP_H,0), pitchDial=dialCenter(x,y,padW,PAD_H+LYRICS_STRIP_H,1);
-  if (dist(mX(),mY(),volDial.cx,volDial.cy)<volDial.r+4) {
-    drag={type:'dial',param:'vol',  id:drum.id,slotIdx:selectedSlotIdx,startY:mY(),startVal:slot.drumVolumes[drum.id]??0.8}; return true;
-  }
-  if (dist(mX(),mY(),pitchDial.cx,pitchDial.cy)<pitchDial.r+4) {
-    drag={type:'dial',param:'pitch',id:drum.id,slotIdx:selectedSlotIdx,startY:mY(),startVal:slot.drumPitch[drum.id]??0}; return true;
-  }
-  if (mX()>swp.x&&mX()<swp.x+swp.w&&mY()>swp.y&&mY()<swp.y+swp.h) {
-    const cands=slot.drumCandidates[drum.id];
-    if (cands&&cands.length>1) {
-      slot.drumIdx[drum.id]=(slot.drumIdx[drum.id]+1)%cands.length;
-      const nextCand=cands[slot.drumIdx[drum.id]];
-      slot.drumTrimStart[drum.id]=nextCand.trimStart??0; slot.drumTrimEnd[drum.id]=nextCand.trimEnd??1;
-      padFlash[drum.id]=millis(); triggerDrum(drum.id);
-    }
-    return true;
-  }
-  return false;
-}
-
-/** Handle pad-specific buttons (remove, clear/reinit, hamburger menu). Returns true if handled. */
-function onPadButtonInteract(def, x, y, padW) {
-  const slot=currentSlot();
-  const rmCx=x+padW-12, rmCy=y+12;
-  if (dist(mX(),mY(),rmCx,rmCy)<9) { removePad(def.id); return true; }
-  const iconY=y+47;
-  const finalized=!!slot.padFinalized[def.id];
-  if (finalized) {
-    // Dynamic clear-x position: just right of label text
-    const el=slot.padInputEls[def.id];
-    const labelText=el?el.elt.value:'';
-    textSize(9);
-    const labelW=textWidth(labelText);
-    const inputCx=x+5+(padW-24)/2;
-    const clearXPos=min(inputCx+labelW/2+7, x+padW-6);
-    if (dist(mX(),mY(),clearXPos,iconY)<8) { clearPad(def.id); return true; }
-  } else {
-    // Hamburger icon click — toggle menu
-    const hamX=x+padW-14;
-    if (dist(mX(),mY(),hamX,iconY)<8) {
-      // Close all other menus first
-      slot.activePadIds.forEach(id => { if (id!==def.id) slot.padMenuOpen[id]=false; });
-      slot.padMenuOpen[def.id]=!slot.padMenuOpen[def.id];
-      return true;
-    }
-    // Menu item click (if menu is open)
-    if (slot.padMenuOpen[def.id]) {
-      const items=getPadMenuItems(slot,def.id);
-      const menuW=72, itemH=18;
-      const menuX=x+padW-menuW, menuY=y+55;
-      for (let i=0;i<items.length;i++) {
-        const iy=menuY+i*itemH;
-        if (mX()>menuX&&mX()<menuX+menuW&&mY()>iy&&mY()<iy+itemH) {
-          const action=items[i].action;
-          if (action==='prototype') {
-            slot.padMenuOpen[def.id]='prototype';
-          } else if (action==='back') {
-            slot.padMenuOpen[def.id]=true;
-          } else if (action.startsWith('proto:')) {
-            applyPrototype(slot,def.id,action.slice(6));
-          } else if (action==='lyrics') {
-            slot.padMenuOpen[def.id]=false;
-            slot.padMode[def.id]='lyrics';
-            if (slot.transcriptLoaded) openPicker(slot,def.id);
-          } else if (action==='record') {
-            slot.padMenuOpen[def.id]=false;
-            slot.padMode[def.id]='record';
-            startPadRecording(def.id);
-          }
-          return true;
-        }
-      }
-    }
-  }
-  return false;
-}
-
-/** Handle a click on any pad. */
-function onPadInteract(def, x, y, padW, padIndex) {
-  if (onPadControlInteract(def, x, y, padW)) return;
-  if (onPadButtonInteract(def, x, y, padW)) return;
-  const slot=currentSlot();
-  const el=slot.padInputEls[def.id];
-  const focused=el&&el.elt.matches(':focus');
-  if (mX()>x&&mX()<x+padW&&mY()>y&&mY()<y+PAD_H&&!focused) {
-    drag = { type:'reorderPad', padId:def.id, padIndex:padIndex, startX:mX(), startY:mY(), triggered:false };
-  }
-}
-
-/** If any pad menu is open, handle menu/hamburger clicks and consume the event.
- *  Returns true if the click was handled (menu item, hamburger, or close-on-outside). */
-function handleOpenPadMenu() {
-  const slot=currentSlot();
-  const openMenuId=slot.activePadIds.find(id=>slot.padMenuOpen[id]);
-  if (!openMenuId) return false;
-  const {padW,gap,startX,padY}=getPadLayout();
-  const def=getPadDef(openMenuId);
-  const idx=slot.activePadIds.indexOf(openMenuId);
-  const {x,y}=padXY(idx,padW,gap,startX,padY);
-  const items=getPadMenuItems(slot,openMenuId);
-  const menuW=72, itemH=18;
-  const menuX=x+padW-menuW, menuY=y+55, menuH=items.length*itemH;
-  // Click on a menu item
-  if (mX()>menuX&&mX()<menuX+menuW&&mY()>menuY&&mY()<menuY+menuH) {
-    onPadButtonInteract(def,x,y,padW);
-    return true;
-  }
-  // Click on the hamburger (toggle off)
-  const hamX=x+padW-14, iconY=y+47;
-  if (dist(mX(),mY(),hamX,iconY)<8) { slot.padMenuOpen[openMenuId]=false; return true; }
-  // Click anywhere else — close menu
-  slot.padMenuOpen[openMenuId]=false;
-  return true;
-}
-
-function onPadsClick() {
-  const slot=currentSlot();
-  const {padW,gap,startX,padY}=getPadLayout();
+function onKeyGridClick() {
+  const slot = currentSlot();
+  const L = getPadAreaLayout();
 
   // Empty-slot prompt: record / upload icons
   if ((!slotHasAudio(slot) || slot.reuploadPending) && !slot.analyzing) {
-    const cx=cW()/2, cy=padY+PAD_H/2;
-    if (dist(mX(),mY(),cx-50,cy)<24 && phase==='ready') { startRecording(); return; }
-    if (mX()>cx+50-24&&mX()<cx+50+24&&mY()>cy-24&&mY()<cy+24 && phase==='ready') { uploadEl.elt.click(); return; }
-    return;
+    const cx = cW() / 2;
+    const cy = L.gridY + L.gridH / 2;
+    if (dist(mX(), mY(), cx-50, cy) < 24 && phase === 'ready') { startRecording(); return true; }
+    if (mX() > cx+50-24 && mX() < cx+50+24 && mY() > cy-24 && mY() < cy+24 && phase === 'ready') { uploadEl.elt.click(); return true; }
+    return false;
   }
-  if (slot.analyzing) return;
+  if (slot.analyzing) return false;
 
-  const plusPos=plusBtnXY(padW,gap,startX,padY);
-  if (plusPos&&mX()>plusPos.x&&mX()<plusPos.x+padW&&mY()>plusPos.y&&mY()<plusPos.y+PAD_H) {
-    // Check shortcut chips first
-    const chips = protoChipRects(plusPos.x, plusPos.y, padW);
-    for (const chip of chips) {
-      if (mX()>chip.x&&mX()<chip.x+chip.w&&mY()>chip.y&&mY()<chip.y+chip.h) {
-        addPadWithPrototype(chip.name); return;
+  // Bounds check: is click in the grid area?
+  if (mX() < L.gridX || mX() > L.gridX + L.gridW || mY() < L.gridY || mY() > L.gridY + L.gridH) return false;
+
+  // Hit test each key
+  for (let i = 0; i < slot.activePadIds.length; i++) {
+    const id = slot.activePadIds[i];
+    const {x, y} = keyXY(i, L);
+    if (mX() > x && mX() < x+(L.kw||KEY_W) && mY() > y && mY() < y+(L.kh||KEY_H)) {
+      // Select + trigger + flash
+      selectPad(id);
+      triggerDrum(id);
+      padFlash[id] = millis();
+      // Start reorder drag (5px threshold distinguishes from click)
+      drag = { type: 'reorderPad', padId: id, padIndex: i, startX: mX(), startY: mY(), triggered: false };
+      return true;
+    }
+  }
+  return false;
+}
+
+// ── Control panel click handler ─────────────────────────────────────────────
+
+function onControlPanelClick() {
+  const slot = currentSlot();
+  const L = getPadAreaLayout();
+  if (!selectedPadId || !slot.activePadIds.includes(selectedPadId)) return false;
+  if (!slotHasAudio(slot) || slot.analyzing) return false;
+
+  const def = getPadDef(selectedPadId);
+  if (!def) return false;
+
+  // Check classic sub-menu first (can extend past panel bounds)
+  if (slot.padMenuOpen[def.id] === 'classic') {
+    const C = panelControlLayout(L);
+    const inputY = C.ctrlY;
+    const inputH = C.inputRowH - 4;
+    const iconW = 14, iconsPadR = 4;
+    const iconsTotal = 6 * iconW;
+    const iconsLeftEdge = L.panelX + L.panelW - iconsPadR - iconsTotal;
+    const inputX = C.rowX;
+    const inputW = iconsLeftEdge - inputX - 2;
+    const classicIconX = iconsLeftEdge;
+    const menuY = inputY + inputH + 3;
+    const menuX = classicIconX - 2;
+    const menuH = 14;
+    textSize(5);
+    let px = menuX;
+    for (const p of availablePrototypes) {
+      const pw = textWidth(p) + 8;
+      if (mX()>px && mX()<px+pw && mY()>menuY && mY()<menuY+menuH) {
+        applyPrototype(slot, def.id, p);
+        slot.padMenuOpen[def.id] = false;
+        return true;
+      }
+      px += pw + 2;
+    }
+    slot.padMenuOpen[def.id] = false;
+    return true;
+  }
+
+  // Bounds check
+  if (mX() < L.panelX || mX() > L.panelX+L.panelW || mY() < L.panelY || mY() > L.panelY+L.panelH) return false;
+  if (!def) return false;
+  const hasCandidates = slot.drumCandidates[def.id] && slot.drumCandidates[def.id].length > 0;
+  const cands = slot.drumCandidates[def.id] || [];
+  const finalized = !!slot.padFinalized[def.id];
+
+  const isMappedEarly = !!(slot.padMode[def.id] || hasCandidates);
+
+  // Trim bar at top of panel — handles are at bar edges (waveform is zoomed to trim region)
+  const trimX = L.panelX+1, trimY = L.panelY+1, trimW = L.panelW-2;
+  if (isMappedEarly && hasCandidates && mY() > trimY && mY() < trimY+TRIM_H && mX() > trimX && mX() < trimX+trimW) {
+    const dLeft = abs(mX()-trimX), dRight = abs(mX()-(trimX+trimW));
+    if (dLeft < 10 || dRight < 10) {
+      const which = dRight <= dLeft ? 'trimEnd' : 'trimStart';
+      const ts = slot.drumTrimStart[def.id]||0, te = slot.drumTrimEnd[def.id]??1;
+      drag = {type: which, id: def.id, slotIdx: selectedSlotIdx, barX: trimX, barW: trimW,
+              origStart: ts, origEnd: te, proposedStart: ts, proposedEnd: te};
+      return true;
+    }
+  }
+
+  // Controls area
+  const C = panelControlLayout(L);
+
+  // Sliders and chain are only interactive when pad is mapped
+  if (isMappedEarly) {
+    // Volume slider handle
+    const volNorm = (slot.drumVolumes[def.id]??0.8);
+    const volHandleX = C.sliderX + volNorm * C.sliderW;
+    if (abs(mX()-volHandleX)<6 && abs(mY()-C.volSliderY)<8) {
+      drag = {type: 'panelSlider', param: 'vol', id: def.id, slotIdx: selectedSlotIdx, sldX: C.sliderX, sldW: C.sliderW};
+      return true;
+    }
+
+    // Pitch slider handle
+    const pitchNorm = ((slot.drumPitch[def.id]??0)+12)/24;
+    const pitchHandleX = C.sliderX + pitchNorm * C.sliderW;
+    if (abs(mX()-pitchHandleX)<6 && abs(mY()-C.pitchSliderY)<8) {
+      drag = {type: 'panelSlider', param: 'pitch', id: def.id, slotIdx: selectedSlotIdx, sldX: C.sliderX, sldW: C.sliderW};
+      return true;
+    }
+
+    // Chain link toggle
+    {
+      const chainCx = C.chainX;
+      if (abs(mX()-chainCx)<6 && abs(mY()-C.chainY)<6) {
+        const linked = slot.drumPitchSpeedLinked[def.id] ?? true;
+        slot.drumPitchSpeedLinked[def.id] = !linked;
+        if (linked) {
+          slot.drumSpeed[def.id] = 1.0;
+        } else {
+          slot.drumSpeed[def.id] = Math.pow(2, (slot.drumPitch[def.id]??0)/12);
+        }
+        invalidatePitchedCache(selectedSlotIdx, def.id);
+        return true;
       }
     }
-    addPad(); return;
+
+    // Speed slider handle (always interactive — when linked, drags pitch in 12 increments)
+    {
+      const linked = slot.drumPitchSpeedLinked[def.id] ?? true;
+      const speedVal = linked ? Math.pow(2, (slot.drumPitch[def.id]??0)/12) : (slot.drumSpeed[def.id] ?? 1.0);
+      const speedNorm = speedToNorm(speedVal);
+      const speedHandleX = C.sliderX + speedNorm * C.sliderW;
+      if (abs(mX()-speedHandleX)<6 && abs(mY()-C.speedSliderY)<8) {
+        drag = {type: 'panelSlider', param: 'speed', id: def.id, slotIdx: selectedSlotIdx, sldX: C.sliderX, sldW: C.sliderW, linked};
+        return true;
+      }
+    }
   }
-  slot.activePadIds.forEach((id,i) => {
-    const def=getPadDef(id);
-    const {x,y}=padXY(i,padW,gap,startX,padY);
-    onPadInteract(def,x,y,padW,i);
-  });
+
+  // Horizontal icon layout matching render.js drawControlPanel — all 6 icons always present
+  const inputY = C.ctrlY;
+  const inputH = C.inputRowH - 4;
+  const hasTranscript = slot.transcriptLoaded && slot.lyricsTranscript.length > 0;
+  const hasResults = slot.analyzeResults && Object.keys(slot.analyzeResults).length > 0;
+  const hasClassic = hasResults && availablePrototypes.length > 0;
+  const hasSource = !!slot.sourceBuffer;
+  const isMapped = !!(slot.padMode[def.id] || hasCandidates);
+
+  const iconW = 14, iconsPadR = 4;
+  const iconsTotal = 6 * iconW;
+  const iconsLeftEdge = L.panelX + L.panelW - iconsPadR - iconsTotal;
+  const inputX = C.rowX;
+  const inputW = iconsLeftEdge - inputX - 2;
+  const padText = (slot.padText[def.id] || '').trim();
+  const iconCy = inputY + inputH / 2;
+
+  // Walk icons left to right, right-aligned
+  let iconCurX = iconsLeftEdge;
+
+  // Classic (drum) icon — only clickable when hasClassic
+  {
+    const cx = iconCurX + iconW / 2;
+    if (hasClassic && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
+      slot.padMenuOpen[def.id] = slot.padMenuOpen[def.id] === 'classic' ? false : 'classic';
+      return true;
+    }
+    iconCurX += iconW;
+  }
+
+  // Transcript icon — only clickable when transcript loaded
+  {
+    const cx = iconCurX + iconW / 2;
+    if (hasTranscript && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
+      slot.padMode[def.id] = 'lyrics';
+      slot.padFinalized[def.id] = false;
+      if (slot.transcriptLoaded) openPicker(slot, def.id);
+      return true;
+    }
+    iconCurX += iconW;
+  }
+
+  // Freestyle [ ] icon — only clickable when hasSource
+  {
+    const cx = iconCurX + iconW / 2;
+    if (hasSource && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
+      openCustomClipPicker(slot, def.id);
+      return true;
+    }
+    iconCurX += iconW;
+  }
+
+  // Cycle icon — only clickable when > 1 candidate
+  {
+    const cx = iconCurX + iconW / 2;
+    if (cands.length > 1 && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
+      slot.drumIdx[def.id] = (slot.drumIdx[def.id]+1) % cands.length;
+      const nextCand = cands[slot.drumIdx[def.id]];
+      slot.drumTrimStart[def.id] = nextCand.trimStart??0;
+      slot.drumTrimEnd[def.id] = nextCand.trimEnd??1;
+      invalidatePitchedCache(selectedSlotIdx, def.id);
+      padFlash[def.id] = millis(); triggerDrum(def.id);
+      return true;
+    }
+    iconCurX += iconW;
+  }
+
+  // Duplicate icon — only clickable when mapped and unmapped pad available
+  {
+    const cx = iconCurX + iconW / 2;
+    const unmappedPadId = slot.activePadIds.find(pid =>
+      pid !== def.id && !slot.padMode[pid] && !(slot.drumCandidates[pid] && slot.drumCandidates[pid].length > 0)
+    );
+    if (isMapped && unmappedPadId && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
+      // Duplicate this pad's settings to the leftmost unmapped pad
+      const srcId = def.id;
+      slot.padMode[unmappedPadId] = slot.padMode[srcId];
+      slot.padFinalized[unmappedPadId] = slot.padFinalized[srcId];
+      slot.padText[unmappedPadId] = slot.padText[srcId] || '';
+      slot.drumCandidates[unmappedPadId] = (slot.drumCandidates[srcId] || []).map(c => ({...c}));
+      slot.drumIdx[unmappedPadId] = slot.drumIdx[srcId] || 0;
+      slot.drumTrimStart[unmappedPadId] = slot.drumTrimStart[srcId] ?? 0;
+      slot.drumTrimEnd[unmappedPadId] = slot.drumTrimEnd[srcId] ?? 1;
+      slot.drumVolumes[unmappedPadId] = slot.drumVolumes[srcId] ?? 0.8;
+      slot.drumPitch[unmappedPadId] = slot.drumPitch[srcId] ?? 0;
+      slot.drumSpeed[unmappedPadId] = slot.drumSpeed[srcId] ?? 1.0;
+      slot.drumPitchSpeedLinked[unmappedPadId] = slot.drumPitchSpeedLinked[srcId] ?? true;
+      slot.drumEQ[unmappedPadId] = {...(slot.drumEQ[srcId] || { low: 0, mid: 0, high: 0 })};
+      syncSharedInput(); positionSharedInput();
+      return true;
+    }
+    iconCurX += iconW;
+  }
+
+  // Trash icon — only clickable when mapped
+  {
+    const cx = iconCurX + iconW / 2;
+    if (isMapped && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
+      clearPad(def.id);
+      return true;
+    }
+    iconCurX += iconW;
+  }
+
+  // X inside text input (when finalized) — clears text and unmaps
+  if (finalized && padText) {
+    const xX = inputX + inputW - 10;
+    const xY = inputY + inputH/2;
+    if (dist(mX(), mY(), xX, xY) < 7) {
+      clearPad(def.id);
+      return true;
+    }
+  }
+
+  // Inline EQ anchor drag — only when mapped
+  if (isMapped && hasCandidates) {
+    const eq = slot.drumEQ[def.id] || { low: 0, mid: 0, high: 0 };
+    const eqAnchors = [
+      { freq: EQ_LOW_FREQ, band: 'low' },
+      { freq: EQ_MID_FREQ, band: 'mid' },
+      { freq: EQ_HIGH_FREQ, band: 'high' },
+    ];
+    for (const a of eqAnchors) {
+      const ax = eqFreqToX(a.freq, C.eqGraphX, C.eqGraphW);
+      const ay = eqGainToY(eq[a.band], C.eqGraphY, C.eqGraphH);
+      if (dist(mX(), mY(), ax, ay) < 10) {
+        drag = { type: 'eqBand', band: a.band, graphY: C.eqGraphY, graphH: C.eqGraphH,
+                 padId: def.id, slotIdx: selectedSlotIdx };
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
+
 
 /** Try to start a slider drag if mouse is near the handle. Returns true if drag started. */
 function tryStartSliderDrag(handleX, headerMid, dragType, slotIndex, sliderX, sliderW) {
@@ -410,17 +740,6 @@ function tryStartSliderDrag(handleX, headerMid, dragType, slotIndex, sliderX, sl
   return false;
 }
 
-/** Compute target pad index from mouse position during pad reorder drag. */
-function padReorderTargetIdx(mx, my, padW, gap, startX, padY, numPads) {
-  const step = padRowStep();
-  const row = my >= padY + step ? 1 : 0;
-  const rowStart = row === 0 ? 0 : 8;
-  const col = Math.round((mx - startX) / (padW + gap));
-  const maxInRow = row === 0 ? Math.min(numPads, 8) : numPads - 8;
-  const idx = rowStart + constrain(col, 0, Math.max(0, maxInRow));
-  return constrain(idx, 0, numPads);
-}
-
 // ── Mouse handlers ───────────────────────────────────────────────────────────
 
 function mousePressed() {
@@ -428,9 +747,7 @@ function mousePressed() {
   // Close step editor if clicking outside it
   if (_stepEditInput && _stepEditInput.style.display !== 'none' &&
       document.activeElement !== _stepEditInput) closeStepEdit();
-  if (padRecordingId) { stopPadRecording(padRecordingId); return; }
   if (pickerOpen) return;
-  if (handleOpenPadMenu()) return;
   if (phase==='recording') {
     // Click anywhere stops the main recording (same as pressing R)
     stopRecording(); return;
@@ -475,20 +792,58 @@ function mousePressed() {
     return;
   }
   if (phase!=='ready') return;
+  // Cell pitch dropdown intercept — must be before other handlers
+  if (cellPitchDropdown) {
+    const d = cellPitchDropdown;
+    const itemH = 13, menuW = 22, totalItems = 25, zeroIdx = 12;
+    const totalH = totalItems * itemH;
+    const menuY = d.y + d.cellH / 2 - (zeroIdx + 0.5) * itemH;
+    const menuX = d.x + d.cellW / 2 - menuW / 2;
+    const clampedY = constrain(menuY, 2, cH() / UI_SCALE - totalH - 2);
+    const clampedX = constrain(menuX, 2, cW() / UI_SCALE - menuW - 2);
+    if (mX() > clampedX - 2 && mX() < clampedX + menuW + 2 && mY() > clampedY - 2 && mY() < clampedY + totalH + 2) {
+      const idx = Math.floor((mY() - clampedY) / itemH);
+      if (idx >= 0 && idx < totalItems) {
+        const val = 12 - idx;
+        const slot = slots[d.slotIdx];
+        if (slot) {
+          const ecp = editCellPitch(slot);
+          if (!ecp[d.padId]) ecp[d.padId] = new Array(slot.grid.steps).fill(0);
+          ecp[d.padId][d.stepIdx] = val;
+        }
+      }
+      cellPitchDropdown = null;
+      return;
+    }
+    cellPitchDropdown = null;
+    return;
+  }
   // Save/Load buttons in header
   if (mY()<HEADER_H) {
     const {saveBtnX, loadBtnX, btnY, btnW, btnH} = headerBtnRects();
     if (mX()>saveBtnX&&mX()<saveBtnX+btnW&&mY()>btnY&&mY()<btnY+btnH) { saveSession(); return; }
     if (mX()>loadBtnX&&mX()<loadBtnX+btnW&&mY()>btnY&&mY()<btnY+btnH) { loadSession(); return; }
   }
+  if (onControlPanelClick()) return;
+  if (onKeyGridClick()) return;
   if (onSlotHeaderClick()) return;
   if (onSeqControlsClick()) return;
+  if (onSeqLabelClick()) return;
   onSeqCellsClick();
-  onPadsClick();
 }
 
 function mouseDragged() {
   if (!drag) return;
+  if (drag.type==='eqBand') {
+    const slot = slots[drag.slotIdx];
+    if (slot) {
+      const eq = slot.drumEQ[drag.padId] || { low: 0, mid: 0, high: 0 };
+      const gain = constrain((drag.graphY + drag.graphH/2 - mY()) / (drag.graphH/2) * EQ_GAIN_RANGE, -EQ_GAIN_RANGE, EQ_GAIN_RANGE);
+      eq[drag.band] = Math.round(gain * 2) / 2; // snap to 0.5 dB
+      slot.drumEQ[drag.padId] = eq;
+    }
+    return;
+  }
   if (drag.type==='trimOvlStart'||drag.type==='trimOvlEnd'||drag.type==='trimOvlMove') {
     if (!trimState) return;
     const {buffer} = trimState;
@@ -501,11 +856,12 @@ function mouseDragged() {
       return;
     }
     const t=constrain((mX()-wfX)/wfW,0,1)*dur;
+    const maxDur = trimState.mode === 'customClip' ? dur : TRIM_MAX_SECS;
     if (drag.type==='trimOvlStart') {
       trimState.trimStart=constrain(t,0,trimState.trimEnd-0.1);
-      trimState.trimEnd=Math.min(trimState.trimEnd,trimState.trimStart+TRIM_MAX_SECS);
+      trimState.trimEnd=Math.min(trimState.trimEnd,trimState.trimStart+maxDur);
     } else {
-      const maxEnd=Math.min(dur,trimState.trimStart+TRIM_MAX_SECS);
+      const maxEnd=Math.min(dur,trimState.trimStart+maxDur);
       trimState.trimEnd=constrain(t,trimState.trimStart+0.1,maxEnd);
       if (trimPlaySrc) {
         const elapsed=audioCtx.currentTime-trimPlayStartTime;
@@ -528,20 +884,40 @@ function mouseDragged() {
     const slot=slots[drag.slotIdx||selectedSlotIdx];
     if (drag.param==='vol') { slot.drumVolumes[drag.id]=constrain(drag.startVal+dy/80,0,1); }
     else { slot.drumPitch[drag.id]=constrain(Math.round(drag.startVal+dy/8),-12,12); }
+  } else if (drag.type==='panelSlider') {
+    const frac=constrain((mX()-drag.sldX)/drag.sldW,0,1);
+    const slot=slots[drag.slotIdx||selectedSlotIdx];
+    if (drag.param==='vol') { slot.drumVolumes[drag.id]=frac; }
+    else if (drag.param==='pitch') { slot.drumPitch[drag.id]=Math.round(frac*24-12); }
+    else if (drag.param==='speed') {
+      if (drag.linked) {
+        // When linked, speed drag moves pitch in semitone steps
+        // frac 0→-12, 0.5→0, 1→+12 (log scale: frac maps to speed, speed maps to semitones)
+        const semitones = Math.round(normToSpeed(frac) > 0 ? 12 * Math.log2(normToSpeed(frac)) : 0);
+        slot.drumPitch[drag.id] = constrain(semitones, -12, 12);
+      } else {
+        slot.drumSpeed[drag.id]=normToSpeed(frac);
+      }
+    }
   } else if (drag.type==='trimStart') {
-    // Mouse displacement from left edge → context fraction change
-    const dx=mX()-drag.barX;
-    const range=drag.origEnd-drag.origStart;
-    const newStart=drag.origStart+dx*(range/drag.barW);
-    drag.proposedStart=constrain(newStart,0,drag.origEnd-0.02);
-    drag.proposedEnd=drag.origEnd;
+    // Accumulate displacement at current zoom level so handle tracks 1:1 with cursor
+    const prevMX = drag.lastMouseX ?? mX();
+    const dx = mX() - prevMX;
+    drag.lastMouseX = mX();
+    const curStart = drag.proposedStart ?? drag.origStart;
+    const curRange = (drag.proposedEnd ?? drag.origEnd) - curStart;
+    const delta = dx * (Math.max(curRange, 0.01) / drag.barW);
+    drag.proposedStart = constrain(curStart + delta, 0, drag.origEnd - 0.002);
+    drag.proposedEnd = drag.origEnd;
   } else if (drag.type==='trimEnd') {
-    // Mouse displacement from right edge → context fraction change
-    const dx=mX()-(drag.barX+drag.barW);
-    const range=drag.origEnd-drag.origStart;
-    const newEnd=drag.origEnd+dx*(range/drag.barW);
-    drag.proposedStart=drag.origStart;
-    drag.proposedEnd=constrain(newEnd,drag.origStart+0.02,1);
+    const prevMX = drag.lastMouseX ?? mX();
+    const dx = mX() - prevMX;
+    drag.lastMouseX = mX();
+    const curEnd = drag.proposedEnd ?? drag.origEnd;
+    const curRange = curEnd - (drag.proposedStart ?? drag.origStart);
+    const delta = dx * (Math.max(curRange, 0.01) / drag.barW);
+    drag.proposedStart = drag.origStart;
+    drag.proposedEnd = constrain(curEnd + delta, drag.origStart + 0.002, 1);
   } else if (drag.type==='bpm') {
     seqBPM=constrain(map(mX(),drag.sliderX,drag.sliderX+drag.sliderW,40,240),40,240);
   } else if (drag.type==='seqVolH') {
@@ -565,6 +941,10 @@ function mouseDragged() {
     const {gridTop}=getSeqLayout();
     drag.currentY=mY()>=gridTop?mY()+seqScrollY:mY();
   } else if (drag.type==='reorderPad') {
+    const dx=mX()-drag.startX, dy=mY()-drag.startY;
+    if (Math.abs(dx)>5||Math.abs(dy)>5) drag.triggered=true;
+    drag.currentX=mX(); drag.currentY=mY();
+  } else if (drag.type==='reorderSeqLabel') {
     const dx=mX()-drag.startX, dy=mY()-drag.startY;
     if (Math.abs(dx)>5||Math.abs(dy)>5) drag.triggered=true;
     drag.currentX=mX(); drag.currentY=mY();
@@ -602,6 +982,9 @@ function mouseReleased() {
     slot.drumTrimStart[drag.id]=drag.proposedStart??drag.origStart;
     slot.drumTrimEnd[drag.id]=drag.proposedEnd??drag.origEnd;
   }
+  if (drag&&drag.type==='panelSlider'&&(drag.param==='pitch'||drag.param==='speed')) {
+    invalidatePitchedCache(drag.slotIdx, drag.id);
+  }
   if (drag&&drag.type==='reorderMeasure') {
     if (drag.targetIdx!==undefined&&drag.targetIdx!==drag.fromIdx) {
       reorderMeasures(drag.slotIndex, drag.fromIdx, drag.targetIdx);
@@ -613,13 +996,39 @@ function mouseReleased() {
     reorderSlots(drag.slotIndex,tgt);
   }
   if (drag&&drag.type==='reorderPad') {
-    if (!drag.triggered) {
-      triggerDrum(drag.padId);
-    } else {
-      const {padW,gap,startX,padY}=getPadLayout();
+    if (drag.triggered) {
+      const L=getPadAreaLayout();
       const slot=currentSlot();
-      const tgt=padReorderTargetIdx(mX(),mY(),padW,gap,startX,padY,slot.activePadIds.length);
+      const tgt=keyReorderTargetIdx(mX(),mY(),L,slot.activePadIds.length);
       if (tgt!==drag.padIndex) reorderPads(drag.padIndex,tgt);
+    }
+  }
+  if (drag&&drag.type==='reorderSeqLabel') {
+    if (drag.triggered) {
+      const {seqRowHeight,gridTop}=getSeqLayout();
+      const slot=slots[drag.slotIdx];
+      const seqDrums=getSeqPads(slot);
+      const slotGridTopY=getSlotGridTop(drag.slotIdx,gridTop,seqRowHeight);
+      const tgt=seqLabelReorderTarget(drag,drag.slotIdx,slotGridTopY,seqRowHeight);
+      const fromSeqIdx=drag.seqRowIdx;
+      if (tgt!==fromSeqIdx && tgt!==fromSeqIdx+1) {
+        // Map seq row indices to activePadIds indices
+        const fromPadIdx=slot.activePadIds.indexOf(seqDrums[fromSeqIdx].id);
+        let toPadIdx;
+        if (tgt>=seqDrums.length) {
+          // After last seq row: place after the last seq pad in activePadIds
+          toPadIdx=slot.activePadIds.indexOf(seqDrums[seqDrums.length-1].id)+1;
+        } else {
+          // Before seq row tgt: place at the first position before that seq pad
+          // (i.e. right after the previous seq pad, or at 0 if tgt is 0)
+          if (tgt===0) {
+            toPadIdx=0;
+          } else {
+            toPadIdx=slot.activePadIds.indexOf(seqDrums[tgt-1].id)+1;
+          }
+        }
+        reorderPads(fromPadIdx,toPadIdx);
+      }
     }
   }
   drag=null;
@@ -640,12 +1049,19 @@ function mouseWheel(event) {
 
 function keyPressed() {
   if (document.activeElement&&document.activeElement.classList.contains('pad-input')) return;
+  if (key==='`') {
+    _debugOpen=!_debugOpen;
+    const panel=document.getElementById('debug-panel');
+    if (panel) panel.style.display=_debugOpen?'block':'none';
+    return;
+  }
+  if (key==='Escape' && cellPitchDropdown) { cellPitchDropdown = null; return; }
   if (key==='r'||key==='R') {
     if (phase==='recording') stopRecording(); else if (phase==='ready') startRecording(); return;
   }
   if (phase==='ready') {
     const id=_kbdMap[key.toLowerCase()];
-    if (id) { triggerDrum(id); padHeld[id]=true; if (seqRecording&&seqPlaying) quantizeToGrid0(id); }
+    if (id) { selectPad(id); triggerDrum(id); padFlash[id]=millis(); padHeld[id]=true; if (seqRecording&&seqPlaying) quantizeToGrid0(id); }
     if (key===' ') { seqPlaying?stopSequencer():startSequencer(); }
     if (key==='u'||key==='U') uploadEl.elt.click();
   }
@@ -659,16 +1075,29 @@ function keyReleased() {
 function doubleClicked() {
   if (phase!=='ready') return;
   const slot=currentSlot();
-  const {padW,gap,startX,padY}=getPadLayout();
-  const padTotalHeight=PAD_H+LYRICS_STRIP_H;
-  slot.activePadIds.forEach((id,i) => {
-    const def=getPadDef(id);
-    const {x,y}=padXY(i,padW,gap,startX,padY);
-    if (mX()<x||mX()>x+padW||mY()<y||mY()>y+padTotalHeight) return;
-    const volDial=dialCenter(x,y,padW,padTotalHeight,0), pitchDial=dialCenter(x,y,padW,padTotalHeight,1);
-    if (dist(mX(),mY(),volDial.cx,volDial.cy)<volDial.r+4)     { slot.drumVolumes[def.id]=0.8; return; }
-    if (dist(mX(),mY(),pitchDial.cx,pitchDial.cy)<pitchDial.r+4) { slot.drumPitch[def.id]=0;   return; }
-  });
+  if (!selectedPadId || !slot.activePadIds.includes(selectedPadId)) return;
+  const def=getPadDef(selectedPadId);
+  if (!def) return;
+  const L=getPadAreaLayout();
+  const C=panelControlLayout(L);
+  const hasCands = slot.drumCandidates[def.id] && slot.drumCandidates[def.id].length > 0;
+  const mapped = !!(slot.padMode[def.id] || hasCands);
+  if (!mapped) return;
+  // Double-click on vol/pitch/speed slider area resets to default
+  if (mX()>C.sliderX-4 && mX()<C.sliderX+C.sliderW+4) {
+    if (abs(mY()-C.volSliderY)<10) { slot.drumVolumes[def.id]=0.8; return; }
+    if (abs(mY()-C.pitchSliderY)<10) { slot.drumPitch[def.id]=0; invalidatePitchedCache(selectedSlotIdx, def.id); return; }
+    if (abs(mY()-C.speedSliderY)<10) {
+      if (slot.drumPitchSpeedLinked[def.id]??true) { slot.drumPitch[def.id]=0; }
+      else { slot.drumSpeed[def.id]=1.0; }
+      invalidatePitchedCache(selectedSlotIdx, def.id); return;
+    }
+  }
+  // Double-click on inline EQ graph resets EQ to flat
+  if (mX()>C.eqGraphX && mX()<C.eqGraphX+C.eqGraphW && mY()>C.eqGraphY && mY()<C.eqGraphY+C.eqGraphH) {
+    slot.drumEQ[def.id] = { low: 0, mid: 0, high: 0 };
+    return;
+  }
 }
 
 // ── Transcript picker ────────────────────────────────────────────────────────
@@ -676,11 +1105,9 @@ function doubleClicked() {
 function openPicker(slot, padId) {
   pickerOpen=true; pickerSlot=slot; pickerPadId=padId;
   pickerSel=[]; pickerAnchor=null;
-  const {padW,gap,startX,padY}=getPadLayout();
-  const padIndex=slot.activePadIds.indexOf(padId);
-  const {x:px,y:py}=padXY(padIndex,padW,gap,startX,padY);
-  pickerEl.style.left=Math.min(px*UI_SCALE,windowWidth-430)+'px';
-  pickerEl.style.top=((py+PAD_H+10)*UI_SCALE)+'px';
+  const L=getPadAreaLayout();
+  pickerEl.style.left=Math.min(L.panelX*UI_SCALE,windowWidth-430)+'px';
+  pickerEl.style.top=((L.panelY+L.panelH+4)*UI_SCALE)+'px';
   pickerEl.style.display='block'; renderPickerChips();
 }
 
@@ -752,16 +1179,16 @@ function commitPickerSelection() {
   const slot=pickerSlot;
   const sorted=[...pickerSel].sort((a,b)=>a-b);
   const words=sorted.map(i=>slot.lyricsTranscript[i]);
-  const merged=mergeWordBuffers(slot,words); if (!merged) return;
-  const cand={buffer:merged,score:1.0,time:words[0].start,trimStart:0,trimEnd:1};
+  const startTime=words[0].start, endTime=words[words.length-1].end;
+  const cand=lyricsContextCandidate(slot, startTime, endTime);
+  if (!cand) return;
   slot.drumCandidates[pickerPadId]=[cand]; slot.drumIdx[pickerPadId]=0;
-  slot.drumTrimStart[pickerPadId]=0; slot.drumTrimEnd[pickerPadId]=1;
+  slot.drumTrimStart[pickerPadId]=cand.trimStart; slot.drumTrimEnd[pickerPadId]=cand.trimEnd;
   padFlash[pickerPadId]=millis(); triggerDrum(pickerPadId);
   const text=words.map(w=>w.word).join(' ');
-  const el=slot.padInputEls[pickerPadId];
-  if (el) el.elt.value=text;
+  slot.padText[pickerPadId]=text;
   slot.padFinalized[pickerPadId]=true;
   slot.padMode[pickerPadId]='lyrics';
-  positionPadInputs();
+  syncSharedInput(); positionSharedInput();
   closePicker();
 }

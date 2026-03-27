@@ -20,40 +20,45 @@ function getPadDef(id) { return PAD_DEFS.find(d => d.id === id); }
 
 let availablePrototypes = [];
 
-/** Compute the menu items for a pad's dropdown based on its state. */
-function getPadMenuItems(slot, padId) {
-  const menuState = slot.padMenuOpen[padId];
-  if (!menuState) return [];
-  if (menuState === 'prototype') {
-    const items = [{label: '\u25C2 back', action: 'back'}];
-    availablePrototypes.forEach(p => items.push({label: p, action: 'proto:' + p}));
-    return items;
-  }
-  const items = [];
-  const hasResults = slot.analyzeResults && Object.keys(slot.analyzeResults).length > 0;
-  if (availablePrototypes.length > 0 && hasResults) {
-    items.push({label: 'prototype \u25B8', action: 'prototype'});
-  }
-  if (slot.transcriptLoaded && slot.lyricsTranscript.length > 0) {
-    items.push({label: 'lyrics', action: 'lyrics'});
-  }
-  items.push({label: 'record', action: 'record'});
-  return items;
-}
 
 // ── Palette (HSB: hue/360, sat/100, brightness/100) ─────────────────────────
-const BG        = [210,  4, 93];
-const PANEL     = [210,  2, 99];
-const INK       = [210,  8, 15];
-const INK_DIM   = [210,  5, 45];
-const INK_FAINT = [210,  3, 72];
-const ACCENT    = [205, 45, 62];
+// Editable via debug overlay (backtick key to toggle)
+let _palette = {
+  BG:           [191, 20, 100],
+  PANEL:        [201, 10, 91],
+  CTRL_PANEL:   [210, 16, 100],
+  SEQ_CELL:     [201,  9, 98],
+  SEQ_CELL_ALT: [212, 13, 90],
+  INK:          [210,  8,  0],
+  INK_DIM:      [210,  5,  0],
+  INK_FAINT:    [210,  3,  0],
+  ACCENT:       [205, 45, 75],
+  SELECTED_HDR: [206,  8, 100],
+  DRUM_S: 75, DRUM_B: 53,
+  DRUM_S_LITE: 35, DRUM_B_LITE: 90,
+};
+// Live references — these arrays/values are updated in place by the debug overlay
+const BG        = [191, 20, 100];
+const PANEL     = [201, 10, 91];
+const CTRL_PANEL = [210, 16, 100];
+const SEQ_CELL  = [201,  9, 98];
+const SEQ_CELL_ALT = [212, 13, 90];
+const INK       = [210,  8,  0];
+const INK_DIM   = [210,  5,  0];
+const INK_FAINT = [210,  3,  0];
+const ACCENT    = [205, 45, 75];
 const RED       = [0,  55,  65];
-const SELECTED_HDR = [205, 8, 100];
-const DRUM_S = 70, DRUM_B = 60;
-const DRUM_S_LITE = 35, DRUM_B_LITE = 90;
+const SELECTED_HDR = [206,  8, 100];
+let DRUM_S = 75, DRUM_B = 53;
+let DRUM_S_LITE = 35, DRUM_B_LITE = 90;
 // Fixed measure tab colors (consistent across all sequencers)
 const MEASURE_HUES = [205, 260, 160, 25, 330, 120, 45, 290];
+
+// ── Debug overlay state ────────────────────────────────────────────────────
+let _fontsReady = false;
+let _debugOpen = false;
+let _debugFont = 'Gill Sans';
+let _debugFontSize = 2;
 
 // ── UI scale ────────────────────────────────────────────────────────────────
 const UI_SCALE = 1.25;
@@ -63,12 +68,20 @@ function cW() { return width  / UI_SCALE; }
 function cH() { return height / UI_SCALE; }
 
 // ── Layout constants ─────────────────────────────────────────────────────────
-const PAD_H         = 86;
-const LYRICS_STRIP_H = 14;
-const PAD_ROW_GAP   = 8;
+const PAD_H         = 86;    // legacy — used by control panel height
+const LYRICS_STRIP_H = 14;   // legacy
+const PAD_ROW_GAP   = 8;     // legacy
 const INPUT_H       = 26;
 const TRIM_H        = 22;
 const TRIM_GAP      = 0;
+
+// ── Keyboard grid + control panel ───────────────────────────────────────────
+const KEY_W           = 36;
+const KEY_H           = 28;
+const KEY_GAP         = 3;
+const KEY_ROW2_OFFSET = 15;
+const CTRL_PANEL_MIN_W = 160;
+const CTRL_PANEL_GAP  = 12;  // gap between key grid and control panel
 const SEQ_ROW_H_MIN = 13;
 const SEQ_ROW_H_MAX = 28;
 let   SLOT_HDR_H    = 22;
@@ -86,6 +99,16 @@ const MIN_WIDTH     = 775;
 
 // ── Trimmer ──────────────────────────────────────────────────────────────────
 const TRIM_MAX_SECS = 30;
+
+// ── EQ ────────────────────────────────────────────────────────────────────────
+const EQ_LOW_FREQ  = 200;
+const EQ_MID_FREQ  = 1000;
+const EQ_HIGH_FREQ = 5000;
+const EQ_MID_Q     = 1.0;
+const EQ_GAIN_RANGE = 18;
+// Log-spaced frequencies for curve drawing (20Hz–20kHz)
+const EQ_CURVE_FREQS = new Float32Array(200);
+for (let _i = 0; _i < 200; _i++) EQ_CURVE_FREQS[_i] = 20 * Math.pow(1000, _i / 199);
 
 // ── Sequencer timing ─────────────────────────────────────────────────────────
 const LOOKAHEAD_MS   = 25;
@@ -133,13 +156,13 @@ function createSlot() {
   _nextHueOffset = (_nextHueOffset + 137) % 360; // golden-angle step for variety
   return {
     drumCandidates: {}, drumIdx: {}, drumVolumes: {}, drumPitch: {},
-    drumTrimStart: {}, drumTrimEnd: {},
+    drumTrimStart: {}, drumTrimEnd: {}, drumEQ: {},
+    drumSpeed: {}, drumPitchSpeedLinked: {},
     activePadIds: [],
-    padInputEls: {}, padFinalized: {}, padMode: {}, padMenuOpen: {},
-    padRecording: {}, padRecLabels: {}, padRecorders: {},
+    padText: {}, padFinalized: {}, padMode: {}, padMenuOpen: {},
     sessionId: null, sourceBuffer: null, analyzeResults: {},
     lyricsTranscript: [], transcriptLoaded: false, analyzing: false, reuploadPending: false,
-    grid: { steps: 16, measures: [{ cells: {} }], editMeasure: 0 }, gridVolume: 1.0, swing: 0, humanize: 0, muted: false, soloed: false,
+    grid: { steps: 16, measures: [{ cells: {}, cellPitch: {} }], editMeasure: 0 }, gridVolume: 1.0, swing: 0, humanize: 0, muted: false, soloed: false,
     humanizeSeeds: makeHumanizeSeeds(),
     hueOffset: offset,
     fileName: null,

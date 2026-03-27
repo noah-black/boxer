@@ -1,44 +1,70 @@
 // ── BOXER — All drawing: header, pads, sequencer, overlays, layout ───────────
 
-// ── Background gradient ──────────────────────────────────────────────────────
+// ── Background ──────────────────────────────────────────────────────────────
 
 function drawBgGradient() {
-  const ctx = drawingContext;
-  const grad = ctx.createLinearGradient(0, 0, 0, height);
-  grad.addColorStop(0, '#ffffff');
-  grad.addColorStop(1, '#badcff');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, width, height);
+  const [h,s,b] = BG;
+  const [,,l] = hsbToHsl(h,s,b);
+  drawingContext.fillStyle = `hsl(${h},${s}%,${l}%)`;
+  drawingContext.fillRect(0, 0, width, height);
 }
 
 // ── Layout computation ───────────────────────────────────────────────────────
 
-function getPadLayout() {
-  const gap = 0;
-  const numActive = currentSlot().activePadIds.length;
-  const hasPlus = numActive < PAD_DEFS.length;
-  const row0cols = Math.min(numActive, 8) + (numActive <= 8 && hasPlus ? 1 : 0);
-  const nCols    = Math.max(row0cols, 1);
-  const padW   = max(66, min(96, (cW()-SEQ_MARGIN*2) / nCols));
-  const total  = padW * nCols;
-  const startX = (cW()-total)/2;
-  const padY   = HEADER_H+10+TRIM_H+TRIM_GAP;
-  const numPadRows = numActive > 8 ? 2 : 1;
-  return { padW, gap, startX, padY, numPadRows };
+/** Compute keyboard grid + control panel layout.
+ *  Panel on left ~1/3, keys on right ~2/3 of content area. */
+function getPadAreaLayout() {
+  const PAD_AREA_TOP = HEADER_H + 42; // 20px enclosure padding + 20px clearance from header
+
+  // Sequencer width defines the reference area
+  const seqLeft = SEQ_MARGIN;
+  const seqRight = cW() - SEQ_MARGIN;
+  const seqW = seqRight - seqLeft;
+  const eqZoneW = 100;  // inline EQ graph width
+  const panelW = CTRL_PANEL_MIN_W + eqZoneW;
+
+  // Scale keys up 50% ideally, but shrink to fit available space
+  const targetKW = Math.round(KEY_W * 1.5);
+  const targetKH = Math.round(KEY_H * 1.5);
+  // Row 2 extends KEY_ROW2_OFFSET past gridW, so account for full actual width
+  const fullKeysW = KEY_ROW2_OFFSET + 8 * (targetKW + KEY_GAP);
+  const maxGap = 50;
+  const maxGroupW = seqW; // available space
+  // Compute how much room keys get after panel + gap
+  const keysAvail = maxGroupW - panelW - Math.min(maxGap, 20);
+  const maxKeyW = Math.floor((keysAvail - KEY_ROW2_OFFSET - KEY_GAP) / 8 - KEY_GAP);
+  const scale = Math.min(1, maxKeyW / targetKW);
+  const kw = Math.max(KEY_W, Math.round(targetKW * scale));
+  const kh = Math.max(KEY_H, Math.round(targetKH * scale));
+
+  // gridW includes the row2 offset so the comma key fits inside
+  const gridW = KEY_ROW2_OFFSET + 8 * (kw + KEY_GAP);
+  const keysH = kh * 2 + KEY_GAP * 3;
+  const panelH = Math.round((KEY_H * 2 + KEY_GAP * 3) * 1.9);
+  const gridH = Math.max(panelH, keysH);
+
+  // Position panel and keys as a group with a capped gap, centered in seqW
+  const gap = Math.min(maxGap, Math.max(12, seqW - panelW - gridW));
+  const groupW = panelW + gap + gridW;
+  const groupLeft = seqLeft + Math.max(0, Math.round((seqW - groupW) / 2));
+  const panelX = groupLeft;
+  const gridX = groupLeft + panelW + gap;
+
+  const keysOffsetY = Math.round((panelH - keysH) / 2);
+
+  return { gridX, gridY: PAD_AREA_TOP, gridW, gridH, keysOffsetY, panelX, panelY: PAD_AREA_TOP, panelW, panelH, kw, kh };
 }
 
-function padRowStep() { return PAD_H+LYRICS_STRIP_H+TRIM_H+TRIM_GAP+PAD_ROW_GAP; }
-
-function padXY(padIndex, padW, gap, startX, padY) {
-  const row = padIndex<8?0:1, col = row===0?padIndex:padIndex-8;
-  return { x: startX+col*(padW+gap), y: padY+row*padRowStep() };
-}
-
-function plusBtnXY(padW, gap, startX, padY) {
-  const numActive = currentSlot().activePadIds.length;
-  if (numActive >= PAD_DEFS.length) return null;
-  const row = numActive<=8?0:1, col = row===0?numActive:numActive-8;
-  return { x: startX+col*(padW+gap), y: padY+row*padRowStep() };
+function keyXY(padIndex, layout) {
+  const row = padIndex < 8 ? 0 : 1;
+  const col = row === 0 ? padIndex : padIndex - 8;
+  const offset = row === 1 ? KEY_ROW2_OFFSET : 0;
+  const oy = layout.keysOffsetY || 0;
+  const kw = layout.kw || KEY_W, kh = layout.kh || KEY_H;
+  return {
+    x: layout.gridX + offset + col * (kw + KEY_GAP),
+    y: layout.gridY + oy + KEY_GAP + row * (kh + KEY_GAP),
+  };
 }
 
 function totalSeqContentHeight(seqRowHeight) {
@@ -48,8 +74,8 @@ function totalSeqContentHeight(seqRowHeight) {
 }
 
 function getSeqLayout() {
-  const { padY, numPadRows } = getPadLayout();
-  const seqTop  = padY+(numPadRows-1)*padRowStep()+PAD_H+LYRICS_STRIP_H+14;
+  const L = getPadAreaLayout();
+  const seqTop  = L.gridY + L.gridH + 42; // 20px enclosure padding + 20px clearance below
   const seqW    = cW()-SEQ_MARGIN*2-SEQ_LABEL_W;
   const gridTop = seqTop+SEQ_CTRL_H;
   const available = cH()-gridTop-96; // reserve space for add-slot "+" below last slot
@@ -79,28 +105,24 @@ function getSlotHeaderY(slotIndex, gridTop, seqRowHeight) {
   return getSlotGridTop(slotIndex, gridTop, seqRowHeight) - SLOT_HDR_H;
 }
 
-function trimBarRect(x, y, padW) { return {x, y:y-TRIM_H-TRIM_GAP, w:padW, h:TRIM_H}; }
-
-function dialCenter(x, y, padW, padH, dialIndex) {
-  const spacing = padW/3;
-  return {cx: x+spacing*(dialIndex+1)-spacing*0.05, cy: y+padH-22, r: 10};
-}
-
-function swapBtnRect(x, y, padW) { return {x:x+6, y:y+5, w:13, h:13}; }
 
 
 /** Compute slot header control positions. Sliders compress by up to 20% when space is tight. */
 function slotHeaderLayout(headerRight, nMeasures) {
   nMeasures = nMeasures || 1;
   const btnH=14;
-  const capsuleCellW=btnH, capsuleCells=4, capsuleW=capsuleCellW*capsuleCells;
+  const capsuleCellW=btnH, capsuleCells=2, capsuleW=capsuleCellW*capsuleCells;
   const removeW=14, removeGap=5;
   const removeX=headerRight-5-removeW;
   const capsuleX=removeX-removeGap-capsuleW;
+  // Standalone CLR and DUP buttons to the left of S/M capsule
+  const standaloneW=24, standaloneGap=4;
+  const dupX=capsuleX-standaloneGap-standaloneW;
+  const clrX=dupX-standaloneGap-standaloneW;
 
   // Step stepper: [- NN +] compact widget, fixed width
   const stepW=36, stepH=12;
-  const stepX=capsuleX-8-stepW;
+  const stepX=clrX-8-stepW;
 
   // Measure tabs: right after hamburger
   const measureTabW=12, measurePlusW=12;
@@ -129,6 +151,7 @@ function slotHeaderLayout(headerRight, nMeasures) {
 
   return {
     btnH, capsuleX, capsuleW, capsuleCellW,
+    clrX, dupX, standaloneW,
     removeX, removeW,
     volSliderX, volSliderW,
     swingSliderX, swingSliderW, humSliderX, humSliderW,
@@ -139,47 +162,62 @@ function slotHeaderLayout(headerRight, nMeasures) {
 
 // ── Element positioning ──────────────────────────────────────────────────────
 
-function positionPadInputs() {
-  const { padW, gap, startX, padY } = getPadLayout();
+function positionSharedInput() {
+  if (!_sharedInputEl) return;
   const slot = currentSlot();
-  slot.activePadIds.forEach((id, i) => {
-    const el = slot.padInputEls[id]; if (!el) return;
-    const {x:px, y:py} = padXY(i, padW, gap, startX, padY);
-    const finalized = !!slot.padFinalized[id];
-    const inputW = finalized ? padW-24 : padW-24;
-    el.elt.style.left=((px+5)*UI_SCALE)+'px'; el.elt.style.top=((py+40)*UI_SCALE)+'px';
-    el.elt.style.width=(inputW*UI_SCALE)+'px'; el.elt.style.fontSize=(9*UI_SCALE)+'px';
-    el.elt.style.textAlign='center';
-    el.elt.style.borderBottom = finalized ? 'none' : '1px solid rgba(0,0,0,0.35)';
-    el.elt.readOnly = finalized;
-  });
+  const show = (phase==='ready'||phase==='recording') && slotHasAudio(slot) && !slot.analyzing && !slot.reuploadPending && selectedPadId;
+  if (!show) { _sharedInputEl.style.display='none'; return; }
+  const L = getPadAreaLayout();
+  const finalized = !!slot.padFinalized[selectedPadId];
+  const C = panelControlLayout(L);
+  const inputY = C.ctrlY;
+  const inputH = C.inputRowH - 4;
+  // Match horizontal icon layout from drawControlPanel — all 6 icons right-aligned
+  const iconW = 14, iconsPadR = 4;
+  const iconsTotal = 6 * iconW;
+  const iconsLeftEdge = L.panelX + L.panelW - iconsPadR - iconsTotal;
+  const inputX = C.rowX;
+  const inputW = iconsLeftEdge - inputX - 2;
+  _sharedInputEl.style.display = 'block';
+  _sharedInputEl.style.left = (inputX * UI_SCALE) + 'px';
+  _sharedInputEl.style.top = (inputY * UI_SCALE) + 'px';
+  _sharedInputEl.style.width = (inputW * UI_SCALE) + 'px';
+  _sharedInputEl.style.height = (inputH * UI_SCALE) + 'px';
+  _sharedInputEl.style.fontSize = (13 * UI_SCALE) + 'px';
+  _sharedInputEl.style.textAlign = 'left';
+  _sharedInputEl.style.background = finalized ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.55)';
+  if (finalized) {
+    _sharedInputEl.style.border = '1px solid rgba(0,0,0,0.08)';
+    _sharedInputEl.style.borderRadius = '3px';
+    _sharedInputEl.style.pointerEvents = 'none';
+  } else {
+    _sharedInputEl.style.border = '1px solid rgba(0,0,0,0.2)';
+    _sharedInputEl.style.borderRadius = '3px';
+    _sharedInputEl.style.pointerEvents = 'auto';
+  }
+  _sharedInputEl.style.padding = '1px 4px';
+  _sharedInputEl.readOnly = finalized;
+  // Blur if readonly to prevent stealing keyboard focus
+  if (finalized && document.activeElement === _sharedInputEl) _sharedInputEl.blur();
 }
 
 function updateElementVisibility() {
-  const show = (phase==='ready'||phase==='recording');
-  slots.forEach(slot => {
-    const isCurrent = slot===currentSlot();
-    const visible = show && isCurrent && slotHasAudio(slot) && !slot.analyzing && !slot.reuploadPending;
-    Object.values(slot.padInputEls).forEach(el => {
-      el.elt.style.display = visible?'block':'none';
-    });
-  });
+  positionSharedInput();
 }
 
 // ── Main draw loop ───────────────────────────────────────────────────────────
 
 function draw() {
   if (!_fontsReady) { drawBgGradient(); return; }
+  cursor(ARROW);
   SEQ_MARGIN = min(SEQ_MARGIN_MAX, max(8, (cW() - CONTENT_MIN_W) / 2));
   drawBgGradient();
   push(); scale(UI_SCALE);
   drawHeader(); spinAngle += 0.04;
-  drawPads(); drawSequencer();
-  if (_pendingMenu) drawPadMenu(_pendingMenu.def,_pendingMenu.x,_pendingMenu.y,_pendingMenu.padW);
+  drawPadAreaEnclosure(); drawKeyGrid(); drawControlPanel(); drawSequencer();
   if      (phase === 'recording')  drawRecordingOverlay();
   else if (phase === 'trimming')   drawTrimOverlay();
-else if (phase === 'error')      drawErrorOverlay();
-  if (padRecordingId) drawPadRecordingOverlay();
+  else if (phase === 'error')      drawErrorOverlay();
   pop();
 }
 
@@ -192,9 +230,9 @@ function drawHeader() {
     const logoW = logoImg.width * (logoH / logoImg.height);
     image(logoImg, 16, (HEADER_H - logoH) / 2, logoW, logoH);
   }
-  // Save/Load buttons
+  // Save/Load buttons — flush right
   const btnW = 26, btnH = 28, btnGap = 6;
-  const loadBtnX = cW() - SEQ_MARGIN - btnW;
+  const loadBtnX = cW() - btnW - 4;
   const saveBtnX = loadBtnX - btnW - btnGap;
   const btnY = (HEADER_H - btnH) / 2;
   const hoverSave = mX()>saveBtnX&&mX()<saveBtnX+btnW&&mY()>btnY&&mY()<btnY+btnH;
@@ -223,211 +261,19 @@ function drawHeader() {
 
 function headerBtnRects() {
   const btnW = 26, btnH = 28, btnGap = 6;
-  const loadBtnX = cW() - SEQ_MARGIN - btnW;
+  const loadBtnX = cW() - btnW - 4;
   const saveBtnX = loadBtnX - btnW - btnGap;
   const btnY = (HEADER_H - btnH) / 2;
   return { saveBtnX, loadBtnX, btnY, btnW, btnH };
 }
 
-// ── Trim bar (waveform above each pad) ───────────────────────────────────────
-
-function drawTrimBar(drum, x, y, padW, roundLeft=true, roundRight=true) {
-  const slot = currentSlot();
-  const tb = trimBarRect(x, y, padW);
-  const hasCandidates = slot.drumCandidates[drum.id] && slot.drumCandidates[drum.id].length>0;
-  const curCand = hasCandidates ? slot.drumCandidates[drum.id][slot.drumIdx[drum.id]] : null;
-  const overTrimBar = mX()>tb.x&&mX()<tb.x+tb.w&&mY()>tb.y&&mY()<tb.y+tb.h;
-  fill(...PANEL); stroke(...INK); strokeWeight(1); rect(tb.x,tb.y,tb.w,tb.h,roundLeft?3:0,roundRight?3:0,0,0);
-  if (hasCandidates&&curCand) {
-    // Get full context channel data
-    let channel;
-    if (curCand.buffer) { channel = curCand.buffer.getChannelData(0); }
-    else if (slot.sourceBuffer) {
-      const sr=slot.sourceBuffer.sampleRate;
-      const sampleStart=Math.max(0,Math.floor((curCand.ctxStart||0)*sr));
-      const sampleEnd=Math.min(slot.sourceBuffer.length,Math.ceil((curCand.ctxEnd||1)*sr));
-      channel=slot.sourceBuffer.getChannelData(0).subarray(sampleStart,sampleEnd);
-    }
-    if (!channel) return;
-
-    // Determine display range: normally [trimStart, trimEnd], modified during drag
-    const ts=slot.drumTrimStart[drum.id]||0, te=slot.drumTrimEnd[drum.id]??1;
-    const activeDrag=drag&&(drag.type==='trimStart'||drag.type==='trimEnd')&&drag.id===drum.id;
-    let dispStart=ts, dispEnd=te; // range of context to display (fills the bar)
-    let shrinkHandleFrac=null; // if shrinking, where to draw the handle (0-1 within bar)
-
-    if (activeDrag) {
-      const ps=drag.proposedStart??ts, pe=drag.proposedEnd??te;
-      const extending=(drag.type==='trimStart')?(ps<ts):(pe>te);
-      if (extending) {
-        // Live-preview: show the extended range
-        dispStart=ps; dispEnd=pe;
-      } else {
-        // Shrinking: keep display at committed range, show handle position
-        dispStart=ts; dispEnd=te;
-        if (drag.type==='trimStart') {
-          shrinkHandleFrac=(ps-ts)/(te-ts);
-        } else {
-          shrinkHandleFrac=(pe-ts)/(te-ts);
-        }
-      }
-    }
-
-    // Render waveform scaled to fill bar from dispStart..dispEnd of context
-    const dispLen=dispEnd-dispStart;
-    if (dispLen>0.001) {
-      for (let px=0; px<tb.w; px++) {
-        const ctxFrac=dispStart+(px/tb.w)*dispLen;
-        const sampleIdx=Math.floor(constrain(ctxFrac,0,1)*(channel.length-1));
-        const step=max(1,Math.floor(dispLen*channel.length/tb.w));
-        let peak=0;
-        for (let s2=sampleIdx; s2<min(sampleIdx+step,channel.length); s2++) peak=max(peak,abs(channel[s2]));
-        const barHeight=peak*(tb.h-4)*0.9;
-        // During shrink drag, dim the area being trimmed away
-        let inActive=true;
-        if (shrinkHandleFrac!==null) {
-          const barFrac=px/tb.w;
-          if (drag.type==='trimStart') inActive=barFrac>=shrinkHandleFrac;
-          else inActive=barFrac<=shrinkHandleFrac;
-        }
-        stroke(drum.hue,inActive?DRUM_S:22,inActive?DRUM_B:80); strokeWeight(1);
-        line(tb.x+px,tb.y+tb.h/2-barHeight/2,tb.x+px,tb.y+tb.h/2+barHeight/2);
-      }
-      // Shrink drag: dark mask over trimmed region
-      if (shrinkHandleFrac!==null) {
-        noStroke(); fill(...BG,55);
-        if (drag.type==='trimStart') {
-          rect(tb.x+1,tb.y+1,shrinkHandleFrac*(tb.w-2),tb.h-2,2,0,0,2);
-        } else {
-          const maskX=tb.x+1+shrinkHandleFrac*(tb.w-2);
-          rect(maskX,tb.y+1,(1-shrinkHandleFrac)*(tb.w-2),tb.h-2,0,2,2,0);
-        }
-      }
-    }
-
-    // Handles: at edges normally, at shrink position during shrink drag
-    const nearLeft=abs(mX()-tb.x)<8&&overTrimBar&&!activeDrag;
-    const nearRight=abs(mX()-(tb.x+tb.w))<8&&overTrimBar&&!activeDrag;
-    if (shrinkHandleFrac!==null) {
-      // Draw handle at shrink position
-      const hx=tb.x+shrinkHandleFrac*tb.w;
-      fill(drum.hue,80,65); noStroke(); rect(hx-1.5,tb.y,3,tb.h,1);
-    }
-    // Always draw edge handles
-    fill(drum.hue,nearLeft?80:DRUM_S,nearLeft?65:DRUM_B); noStroke(); rect(tb.x,tb.y,3,tb.h,roundLeft?1:0);
-    fill(drum.hue,nearRight?80:DRUM_S,nearRight?65:DRUM_B); rect(tb.x+tb.w-3,tb.y,3,tb.h,0,roundRight?1:0,0,0);
-  }
-}
-
-// ── Pad body ─────────────────────────────────────────────────────────────────
-
-function drawPad(def, x, y, padW, roundLeft, roundRight) {
-  const slot = currentSlot();
-  const hasCandidates = slot.drumCandidates[def.id] && slot.drumCandidates[def.id].length>0;
-  const cands = slot.drumCandidates[def.id] || [];
-  const el = slot.padInputEls[def.id];
-  const textValue = el ? el.elt.value.trim() : '';
-  const hasText = textValue!=='';
-  const finalized = !!slot.padFinalized[def.id];
-  const padLive = hasCandidates || hasText;
-  const ago = millis()-(padFlash[def.id]||-9999);
-  const active = (max(0,1-ago/110)>0)||(padHeld[def.id]||false);
-  const padTotalHeight = PAD_H+LYRICS_STRIP_H;
-  const tb=trimBarRect(x,y,padW), swp=swapBtnRect(x,y,padW);
-  const volDialPos=dialCenter(x,y,padW,PAD_H+LYRICS_STRIP_H,0), pitchDialPos=dialCenter(x,y,padW,PAD_H+LYRICS_STRIP_H,1);
-  const overTrimBar=mX()>tb.x&&mX()<tb.x+tb.w&&mY()>tb.y&&mY()<tb.y+tb.h;
-  const overVol=dist(mX(),mY(),volDialPos.cx,volDialPos.cy)<volDialPos.r+4;
-  const overPitch=dist(mX(),mY(),pitchDialPos.cx,pitchDialPos.cy)<pitchDialPos.r+4;
-  const overSwap=mX()>swp.x&&mX()<swp.x+swp.w&&mY()>swp.y&&mY()<swp.y+swp.h;
-  const overPad=mX()>x&&mX()<x+padW&&mY()>y&&mY()<y+PAD_H&&!overVol&&!overPitch&&!overSwap;
-
-  // Trim bar
-  drawTrimBar(def,x,y,padW,roundLeft,roundRight);
-
-  // Pad body
-  const padSat=active?14:(overPad&&padLive)?8:padLive?5:3;
-  const padBri=active?94:98;
-  if (!hasText&&!hasCandidates) fill(...BG,40); else fill(def.hue,padSat,padBri);
-  stroke(...INK); strokeWeight(active?2:1); rect(x,y,padW,padTotalHeight,0,0,roundRight?CORNER_RADIUS:0,roundLeft?CORNER_RADIUS:0);
-  fill(active?INK_DIM:padLive?[def.hue,DRUM_S,DRUM_B]:INK_FAINT);
-  noStroke(); textSize(32); textAlign(CENTER,CENTER);
-  text(padDisplayKey(def.id),x+padW/2,y+PAD_H/2-22);
-  drawDial(def,x,y,padW,PAD_H+LYRICS_STRIP_H,0,slot.drumVolumes[def.id]??0.8, 0,  1, hasCandidates,active);
-  drawDial(def,x,y,padW,PAD_H+LYRICS_STRIP_H,1,slot.drumPitch[def.id]??0,   -12, 12,hasCandidates,active);
-  // Swap button
-  if (cands.length>1) {
-    const hov=mX()>swp.x&&mX()<swp.x+swp.w&&mY()>swp.y&&mY()<swp.y+swp.h;
-    fill(hov?ACCENT:PANEL); stroke(...INK_FAINT); strokeWeight(1); circle(swp.x+swp.w/2,swp.y+swp.h/2,swp.w);
-    fill(...INK); noStroke(); textSize(8); textAlign(CENTER,CENTER); text('\u21bb',swp.x+swp.w/2,swp.y+swp.h/2+1);
-    fill(...INK); textSize(6); textStyle(BOLD); textAlign(CENTER,TOP);
-    text(`${(slot.drumIdx[def.id]||0)+1}/${cands.length}`,swp.x+swp.w/2,swp.y+swp.h+2); textStyle(NORMAL);
-  }
-  // Remove-pad × (top-right)
-  const rmSize=7;
-  const rmCx=x+padW-12,rmCy=y+12;
-  const rmHov=dist(mX(),mY(),rmCx,rmCy)<rmSize+2;
-  push(); strokeCap(ROUND); noFill();
-  stroke(rmHov?RED:INK_FAINT); strokeWeight(2);
-  line(rmCx-rmSize/2,rmCy-rmSize/2,rmCx+rmSize/2,rmCy+rmSize/2); line(rmCx+rmSize/2,rmCy-rmSize/2,rmCx-rmSize/2,rmCy+rmSize/2);
-  pop(); if (rmHov) cursor(HAND);
-  // Input row icons (vertically centred with the DOM input at y+40)
-  const iconY=y+47;
-  if (finalized) {
-    // Clear × — positioned just right of the pad label text, clamped to input width
-    const el=slot.padInputEls[def.id];
-    const labelText=el?el.elt.value:'';
-    textSize(9);
-    const labelW=textWidth(labelText);
-    const inputW=padW-24;
-    const inputCx=x+5+inputW/2; // center of the input field
-    const visibleLabelW=min(labelW, inputW);
-    const clearXPos=inputCx+visibleLabelW/2+7;
-    const clampedClearX=min(clearXPos, x+padW-6);
-    const clearSize=3.5;
-    const clearHov=dist(mX(),mY(),clampedClearX,iconY)<clearSize+4;
-    push(); strokeCap(ROUND); noFill();
-    stroke(clearHov?RED:INK_FAINT); strokeWeight(1.5);
-    line(clampedClearX-clearSize/2,iconY-clearSize/2,clampedClearX+clearSize/2,iconY+clearSize/2); line(clampedClearX+clearSize/2,iconY-clearSize/2,clampedClearX-clearSize/2,iconY+clearSize/2);
-    pop(); if (clearHov) cursor(HAND);
-  } else {
-    // Hamburger menu icon
-    const hamX=x+padW-14, hamHov=dist(mX(),mY(),hamX,iconY)<8;
-    fill(hamHov?INK_DIM:INK_FAINT); noStroke();
-    for (let li=0;li<3;li++) rect(hamX-4,iconY-4+li*3.5,8,1.5,0.75);
-    if (hamHov) cursor(HAND);
-  }
-  // Cursor
-  const nearHandle=hasCandidates&&overTrimBar&&(abs(mX()-tb.x)<8||abs(mX()-(tb.x+tb.w))<8);
-  cursor(nearHandle||overVol||overPitch||(overSwap&&cands.length>1)||(overPad&&padLive)?HAND:ARROW);
-}
-
-// ── Hamburger dropdown (drawn in second pass above other pads) ──────────────
-
-function drawPadMenu(def, x, y, padW) {
-  const slot = currentSlot();
-  if (!slot.padMenuOpen[def.id]) return;
-  const items = getPadMenuItems(slot, def.id);
-  if (items.length === 0) return;
-  const menuW=72, itemH=18;
-  const menuX=x+padW-menuW, menuY=y+55;
-  fill(...PANEL); stroke(...INK); strokeWeight(1);
-  rect(menuX,menuY,menuW,itemH*items.length,3);
-  items.forEach((item,i) => {
-    const iy=menuY+i*itemH;
-    const hov=mX()>menuX&&mX()<menuX+menuW&&mY()>iy&&mY()<iy+itemH;
-    if (hov) { fill(...BG); noStroke(); rect(menuX+1,iy+(i===0?1:0),menuW-2,itemH-(i===0||i===items.length-1?1:0),i===0?2:0,i===0?2:0,i===items.length-1?2:0,i===items.length-1?2:0); cursor(HAND); }
-    fill(hov?INK:INK_DIM); noStroke(); textSize(7); textAlign(LEFT,CENTER);
-    text(item.label,menuX+6,iy+itemH/2);
-  });
-}
-
-// ── Plus button ──────────────────────────────────────────────────────────────
+// ── Plus helper (reused by add-slot button) ──────────────────────────────────
 
 const PLUS_FONT_SIZE = 64;
 
 function _drawPlus(centerX, centerY, hov) {
   drawingContext.save();
-  drawingContext.font = PLUS_FONT_SIZE+"px 'Silkscreen', monospace";
+  drawingContext.font = PLUS_FONT_SIZE+"px '"+_debugFont+"', monospace";
   drawingContext.textAlign = 'center'; drawingContext.textBaseline = 'middle';
   drawingContext.strokeStyle = 'rgba(20,17,10,0.35)';
   drawingContext.lineWidth = 1.5; drawingContext.lineJoin = 'round';
@@ -438,186 +284,798 @@ function _drawPlus(centerX, centerY, hov) {
   if (hov) cursor(HAND);
 }
 
-const PROTO_SHORTCUTS = [
-  { name: 'kick',  label: 'kick',  hue: 10  },
-  { name: 'snare', label: 'snare', hue: 205 },
-  { name: 'hihat', label: 'hihat', hue: 80  },
-  { name: 'clap',  label: 'clap',  hue: 295 },
-];
-
-function protoChipRects(x, y, padW) {
-  const slot = currentSlot();
-  if (!slot.analyzeResults || Object.keys(slot.analyzeResults).length === 0) return [];
-  const chips = PROTO_SHORTCUTS.filter(p => slot.analyzeResults[p.name]);
-  if (chips.length === 0) return [];
-  const cx = x + padW/2, cy = y + PAD_H/2;
-  const chipW = 28, chipH = 24, gap = 4;
-  // Spread chips out from center, but clamp so they stay within the padW column
-  const maxSpread = Math.max(0, padW/2 - chipW - gap/2 - 1);
-  const spread = Math.min(10, maxSpread);
-  const positions = [
-    { dx: -(chipW + gap/2) - spread, dy: -(chipH + gap/2) - spread },
-    { dx: gap/2 + spread,            dy: -(chipH + gap/2) - spread },
-    { dx: -(chipW + gap/2) - spread, dy: gap/2 + spread },
-    { dx: gap/2 + spread,            dy: gap/2 + spread },
-  ];
-  return chips.map((proto, i) => {
-    const pos = positions[i] || positions[0];
-    return {
-      name: proto.name, label: proto.label, hue: proto.hue,
-      x: cx + pos.dx, y: cy + pos.dy, w: chipW, h: chipH
-    };
-  });
-}
-
-function drawPlusButton(x, y, padW) {
-  const chips = protoChipRects(x, y, padW);
-  // Draw "+" centered — chips sit around it in four corners
-  const plusHov = mX()>x&&mX()<x+padW&&mY()>y&&mY()<y+PAD_H && !chips.some(c => mX()>c.x&&mX()<c.x+c.w&&mY()>c.y&&mY()<c.y+c.h);
-  _drawPlus(x+padW/2, y+PAD_H/2, plusHov);
-  const barH = 4;
-  chips.forEach(chip => {
-    const chipHov = mX()>chip.x&&mX()<chip.x+chip.w&&mY()>chip.y&&mY()<chip.y+chip.h;
-    push();
-    // Chip body
-    strokeWeight(1); stroke(...(chipHov ? ACCENT : INK_DIM));
-    fill(...PANEL);
-    rect(chip.x, chip.y, chip.w, chip.h, 3);
-    // Colored top bar
-    noStroke();
-    fill(chip.hue, chipHov ? DRUM_S : DRUM_S_LITE, chipHov ? DRUM_B : DRUM_B_LITE);
-    rect(chip.x+1, chip.y+1, chip.w-2, barH, 2, 2, 0, 0);
-    // Label
-    noStroke(); fill(...(chipHov ? ACCENT : INK_DIM));
-    textSize(7); textAlign(CENTER, CENTER);
-    text(chip.label, chip.x+chip.w/2, chip.y+barH+(chip.h-barH)/2);
-    pop();
-    if (chipHov) cursor(HAND);
-  });
-}
-
 // ── Empty-slot prompt (record / upload icons) ───────────────────────────────
 
-function drawEmptySlotPrompt(padY) {
-  const cx=cW()/2, cy=padY+PAD_H/2;
+function drawEmptySlotPrompt() {
+  const L = getPadAreaLayout();
+  const cx = cW() / 2;
+  const cy = L.gridY + L.gridH / 2;
   const recCx=cx-50, upCx=cx+50;
-  const recR=24;
+  const recR=20;
   const recHov=dist(mX(),mY(),recCx,cy)<recR;
-  const upHov=mX()>upCx-24&&mX()<upCx+24&&mY()>cy-24&&mY()<cy+24;
+  const upHov=mX()>upCx-20&&mX()<upCx+20&&mY()>cy-20&&mY()<cy+20;
 
-  // Record icon — solid red circle
   fill(recHov?[0,75,78]:RED); stroke(...INK); strokeWeight(1);
   circle(recCx,cy,recR*2);
   fill(...PANEL); noStroke(); circle(recCx,cy,recR*0.6);
   fill(recHov?[0,75,78]:RED); noStroke(); circle(recCx,cy,recR*0.5);
 
-  // Upload icon — rounded rect with up-arrow
   noFill(); stroke(upHov?ACCENT:INK); strokeWeight(1.5);
-  rect(upCx-22,cy-22,44,44,6);
-  // Arrow shaft
-  line(upCx,cy+10,upCx,cy-8);
-  // Arrow head
-  line(upCx-7,cy-2,upCx,cy-10); line(upCx+7,cy-2,upCx,cy-10);
-  // Tray base
-  line(upCx-12,cy+10,upCx-12,cy+14); line(upCx-12,cy+14,upCx+12,cy+14); line(upCx+12,cy+14,upCx+12,cy+10);
+  rect(upCx-18,cy-18,36,36,5);
+  line(upCx,cy+8,upCx,cy-6);
+  line(upCx-6,cy-1,upCx,cy-8); line(upCx+6,cy-1,upCx,cy-8);
+  line(upCx-10,cy+8,upCx-10,cy+11); line(upCx-10,cy+11,upCx+10,cy+11); line(upCx+10,cy+11,upCx+10,cy+8);
 
-  // Labels
-  fill(...INK_DIM); noStroke(); textSize(8); textAlign(CENTER,TOP);
-  text('record',recCx,cy+recR+6);
-  text('upload',upCx,cy+28);
+  fill(...INK_DIM); noStroke(); textSize(11); textAlign(CENTER,TOP);
+  text('record',recCx,cy+recR+4);
+  text('upload',upCx,cy+22);
 
   if (recHov||upHov) cursor(HAND);
 }
 
 // ── Analyzing animation (in pad area) ───────────────────────────────────────
 
-function drawAnalyzingAnimation(padY) {
-  const cx=cW()/2, cy=padY+PAD_H/2, ticks=12;
+function drawAnalyzingAnimation() {
+  const L = getPadAreaLayout();
+  const cx = cW() / 2;
+  const cy = L.gridY + L.gridH / 2;
+  const ticks=12;
   for (let i=0;i<ticks;i++) {
     const angle=(i/ticks)*TWO_PI+spinAngle;
     const alpha=pow(((i/ticks+spinAngle/TWO_PI)%1),1.5)*70+5;
     stroke(...ACCENT,alpha); strokeWeight(2);
-    line(cx+cos(angle)*18,cy+sin(angle)*18,cx+cos(angle)*28,cy+sin(angle)*28);
+    line(cx+cos(angle)*14,cy+sin(angle)*14,cx+cos(angle)*22,cy+sin(angle)*22);
   }
-  fill(...ACCENT); noStroke(); circle(cx,cy,5);
-  fill(...INK_DIM); textSize(9); textAlign(CENTER,TOP);
-  text('analyzing\u2026',cx,cy+36);
+  fill(...ACCENT); noStroke(); circle(cx,cy,4);
+  fill(...INK_DIM); textSize(8); textAlign(CENTER,TOP);
+  text('analyzing\u2026',cx,cy+28);
   const slot=currentSlot();
-  if (slot.fileName) { fill(...INK_FAINT); textSize(8); text(slot.fileName,cx,cy+50); }
+  if (slot.fileName) { fill(...INK_FAINT); textSize(7); text(slot.fileName,cx,cy+40); }
 }
 
-// ── All pads ─────────────────────────────────────────────────────────────────
+// ── Keyboard grid ───────────────────────────────────────────────────────────
 
-let _pendingMenu = null;
 
-function drawPads() {
-  const {padW,gap,startX,padY}=getPadLayout();
-  const slot=currentSlot();
-  _pendingMenu=null;
+function drawKey(def, x, y, isSelected, slot, seqActive, ho, kw, kh) {
+  kw = kw || KEY_W; kh = kh || KEY_H;
+  const h = (def.hue + (ho||0)) % 360;
+  const ago = millis()-(padFlash[def.id]||-9999);
+  const flash = max(0, 1-ago/110);
+  const hasCand = slot.drumCandidates[def.id] && slot.drumCandidates[def.id].length>0;
+  const hov = mX()>x && mX()<x+kw && mY()>y && mY()<y+kh;
+  const label = (slot.padText[def.id] || '').trim();
+  const displayKey = padDisplayKey(def.id);
 
-  if ((!slotHasAudio(slot) || slot.reuploadPending) && !slot.analyzing) { drawEmptySlotPrompt(padY); return; }
-  if (slot.analyzing) { drawAnalyzingAnimation(padY); return; }
+  // Background
+  if (flash > 0) {
+    fill(h, 30+flash*30, 80+flash*15);
+  } else if (seqActive) {
+    fill(h, 20, 90);
+  } else if (isSelected) {
+    fill(h, hasCand?25:12, hasCand?88:94);
+  } else if (hov) {
+    fill(h, 8, 96);
+  } else {
+    fill(hasCand ? [h, 5, 98] : [...BG, 40]);
+  }
+  stroke(seqActive ? [h, 50, 60] : (isSelected ? [h, 35, 55] : INK_FAINT));
+  strokeWeight(seqActive ? 2 : (isSelected ? 1.5 : 0.5));
+  rect(x, y, kw, kh, 4);
+
+  // Key letter
+  noStroke();
+  fill(isSelected ? [h, 40, 40] : (hasCand ? INK_DIM : INK_FAINT));
+  textSize(12); textAlign(CENTER, CENTER);
+  text(displayKey, x+kw/2, y + (label ? kh/2-4 : kh/2));
+
+  // Truncated label below letter
+  if (label) {
+    fill(...INK_FAINT); textSize(6); textAlign(CENTER, CENTER);
+    let truncated = label;
+    while (truncated.length > 1 && textWidth(truncated) > kw-14) truncated = truncated.slice(0,-1);
+    if (truncated !== label) truncated += '\u2026';
+    text(truncated, x+kw/2, y+kh/2+7);
+  }
+
+  if (hov) cursor(HAND);
+}
+
+function drawPadAreaEnclosure() {
+  const L = getPadAreaLayout();
+  const slot = currentSlot();
+  if ((!slotHasAudio(slot) || slot.reuploadPending) && !slot.analyzing) return;
+  if (slot.analyzing) return;
+  // Enclosing rounded rectangle spanning panel + keyboard
+  const pad = 20;
+  const left = Math.min(L.panelX, L.gridX) - pad;
+  const right = Math.max(L.panelX + L.panelW, L.gridX + L.gridW) + pad;
+  const top = L.gridY - pad;
+  const bot = L.gridY + L.gridH + pad;
+  fill(...PANEL);
+  stroke(...INK); strokeWeight(1);
+  rect(left, top, right - left, bot - top, CORNER_RADIUS * 2);
+}
+
+function drawKeyGrid() {
+  const L = getPadAreaLayout();
+  const slot = currentSlot();
+
+
+  if ((!slotHasAudio(slot) || slot.reuploadPending) && !slot.analyzing) { drawEmptySlotPrompt(); return; }
+  if (slot.analyzing) { drawAnalyzingAnimation(); return; }
+
+  // Auto-select first pad if none selected
+  if (!selectedPadId || !slot.activePadIds.includes(selectedPadId)) {
+    const newId = slot.activePadIds.length > 0 ? slot.activePadIds[0] : null;
+    if (newId !== selectedPadId) { selectedPadId = newId; syncSharedInput(); positionSharedInput(); }
+  }
 
   const isDragReorder = drag && drag.type==='reorderPad' && drag.triggered;
   const dragId = isDragReorder ? drag.padId : null;
-  const dragTarget = isDragReorder ? padReorderTargetIdx(drag.currentX,drag.currentY,padW,gap,startX,padY,slot.activePadIds.length) : -1;
+  const ho = slot.hueOffset || 0;
 
-  slot.activePadIds.forEach((id,i) => {
-    const def=getPadDef(id);
-    const {x,y}=padXY(i,padW,gap,startX,padY);
-    const roundLeft=(i===0||i===8);
-    const roundRight=false;
-    if (id===dragId) { push(); drawingContext.globalAlpha=0.25; drawPad(def,x,y,padW,roundLeft,roundRight); pop(); }
-    else drawPad(def,x,y,padW,roundLeft,roundRight);
-    if (slot.padMenuOpen[id]) _pendingMenu={def,x,y,padW};
+  // Determine which pads the sequencer is currently triggering
+  const seqActiveIds = new Set();
+  if (seqPlaying) {
+    const slotFrac = slotLoopFraction(selectedSlotIdx);
+    const grid = slot.grid;
+    const mCells = grid.measures[slotFrac.measureIdx % grid.measures.length].cells;
+    const stepPositions = computeStepPositions(grid, slot);
+    const frac = slotFrac.fraction;
+    for (let s = 0; s < grid.steps; s++) {
+      if (frac >= stepPositions[s] && frac < stepPositions[s+1]) {
+        slot.activePadIds.forEach(id => {
+          if (mCells[id] && mCells[id][s]) seqActiveIds.add(id);
+        });
+        break;
+      }
+    }
+  }
+
+  slot.activePadIds.forEach((id, i) => {
+    const def = getPadDef(id);
+    const {x, y} = keyXY(i, L);
+    if (id === dragId) {
+      push(); drawingContext.globalAlpha = 0.25;
+      drawKey(def, x, y, id===selectedPadId, slot, seqActiveIds.has(id), ho, L.kw, L.kh);
+      pop();
+    } else {
+      drawKey(def, x, y, id===selectedPadId, slot, seqActiveIds.has(id), ho, L.kw, L.kh);
+    }
   });
 
-  // Draw insertion indicator during pad reorder
-  if (isDragReorder && dragTarget >= 0) {
-    const insertIdx = dragTarget > drag.padIndex ? dragTarget - 1 : dragTarget;
-    const indicatorX = startX + constrain(dragTarget, 0, slot.activePadIds.length) * (padW + gap);
-    const row = dragTarget <= 8 ? 0 : 1;
-    const iy = padY + row * padRowStep();
-    push(); stroke(205, 45, 62); strokeWeight(2); noFill();
-    line(indicatorX, iy + 4, indicatorX, iy + PAD_H - 4);
-    pop();
-  }
-
-  // Draw ghost pad at cursor
+  // Drag reorder insertion line
   if (isDragReorder) {
+    const dragTarget = keyReorderTargetIdx(drag.currentX, drag.currentY, L, slot.activePadIds.length);
+    if (dragTarget >= 0) {
+      const {x: ix, y: iy} = keyXY(dragTarget, L);
+      push(); stroke(205, 45, 62); strokeWeight(2); noFill();
+      line(ix-1, iy+2, ix-1, iy+(L.kh||KEY_H)-2);
+      pop();
+    }
+    // Ghost key at cursor
     const def = getPadDef(dragId);
-    const ghostX = drag.currentX - padW / 2, ghostY = drag.currentY - PAD_H / 2;
+    const ghostX = drag.currentX-(L.kw||KEY_W)/2, ghostY = drag.currentY-(L.kh||KEY_H)/2;
     push(); drawingContext.globalAlpha = 0.6;
-    drawPad(def, ghostX, ghostY, padW, false, false);
+    drawKey(def, ghostX, ghostY, false, slot, false, ho, L.kw, L.kh);
     pop();
   }
 
-  const plusPos=plusBtnXY(padW,gap,startX,padY);
-  if (plusPos) drawPlusButton(plusPos.x,plusPos.y,padW);
 }
 
-// ── Dials ────────────────────────────────────────────────────────────────────
+// ── Control panel ───────────────────────────────────────────────────────────
 
-function drawDial(drum, x, y, padW, padH, dialIndex, val, vmin, vmax, hasCandidates, active) {
-  const {cx,cy,r}=dialCenter(x,y,padW,padH,dialIndex);
-  const isPitch=(dialIndex===1), t=(val-vmin)/(vmax-vmin);
-  const minAngle=PI*0.75, maxAngle=PI*2.25, valAngle=minAngle+t*(maxAngle-minAngle);
-  stroke(0,0,hasCandidates?80:88); strokeWeight(2); noFill(); arc(cx,cy,r*2,r*2,minAngle,maxAngle);
-  if (hasCandidates) {
-    stroke(drum.hue,active?DRUM_S+10:DRUM_S,active?DRUM_B+5:DRUM_B); strokeWeight(2);
-    if      (isPitch&&val>=0) arc(cx,cy,r*2,r*2,PI*1.5,valAngle);
-    else if (isPitch)         arc(cx,cy,r*2,r*2,valAngle,PI*1.5);
-    else                      arc(cx,cy,r*2,r*2,minAngle,valAngle);
+function drawControlPanel() {
+  const L = getPadAreaLayout();
+  const slot = currentSlot();
+
+  // Don't show control panel when slot has no audio or is analyzing
+  if (!slotHasAudio(slot) || slot.reuploadPending || slot.analyzing) return;
+
+  // Panel background — subtly tinted by selected pad's hue
+  const ho = slot.hueOffset || 0;
+  const def = selectedPadId ? getPadDef(selectedPadId) : null;
+  const hasMappedPad = def && (slot.padMode[def.id] || (slot.drumCandidates[def.id] && slot.drumCandidates[def.id].length>0));
+  if (hasMappedPad) {
+    fill((def.hue + ho) % 360, CTRL_PANEL[1], CTRL_PANEL[2]);
+  } else {
+    fill(...CTRL_PANEL);
   }
-  fill(active?[drum.hue,DRUM_S,DRUM_B+8]:PANEL); stroke(...INK_FAINT); strokeWeight(1); circle(cx,cy,r*2);
-  const lineX=cx+cos(valAngle)*(r-2), lineY=cy+sin(valAngle)*(r-2);
-  stroke(hasCandidates?[drum.hue,DRUM_S,DRUM_B]:INK_FAINT); strokeWeight(1.5); line(cx,cy,lineX,lineY);
-  fill(...INK); noStroke(); textSize(8); textAlign(CENTER,BOTTOM);
-  text(isPitch?'PITCH':'VOL',cx,cy-r-2);
-  fill(...INK_DIM); noStroke(); textSize(7); textAlign(CENTER,TOP);
-  const labelString=isPitch?(val===0?'0':(val>0?'+':'')+Math.round(val)+'st'):Math.round(val*100)+'%';
-  text(labelString,cx,cy+r+1);
+  stroke(...INK); strokeWeight(1);
+  rect(L.panelX, L.panelY, L.panelW, L.panelH, CORNER_RADIUS);
+
+  if (!selectedPadId || !slot.activePadIds.includes(selectedPadId)) {
+    fill(...INK_FAINT); noStroke(); textSize(8); textAlign(CENTER, CENTER);
+    text('select a pad', L.panelX+L.panelW/2, L.panelY+L.panelH/2);
+    return;
+  }
+
+  if (!def) return;
+  // Apply slot hue offset so control panel colors match sequencer
+  const odef = { ...def, hue: (def.hue + ho) % 360 };
+  const hasCandidates = slot.drumCandidates[def.id] && slot.drumCandidates[def.id].length>0;
+  const cands = slot.drumCandidates[def.id] || [];
+  const isMapped = !!(slot.padMode[def.id] || hasCandidates);
+
+  // Trim bar at top of panel
+  const trimX = L.panelX+1, trimY = L.panelY+1, trimW = L.panelW-2;
+  if (isMapped) drawPanelTrimBar(odef, trimX, trimY, trimW, slot);
+  // Divider between waveform and controls
+  stroke(...INK); strokeWeight(1);
+  line(L.panelX, trimY + TRIM_H, L.panelX + L.panelW, trimY + TRIM_H);
+
+  // Below trim bar: controls area
+  const C = panelControlLayout(L);
+
+  // Slider enclosure
+  fill(...SEQ_CELL); stroke(...(isMapped ? INK_FAINT : [...INK_FAINT, 40])); strokeWeight(0.5);
+  rect(C.sliderBoxX, C.sliderBoxY, C.sliderBoxW, C.sliderBoxH, 4);
+
+  // Volume slider
+  drawPanelSlider(odef, C.sliderX, C.volSliderY, C.sliderW, 'vol', slot.drumVolumes[def.id]??0.8, 0, 1, hasCandidates, !isMapped);
+
+  // Chain link icon + connecting lines between pitch and speed
+  const linked = slot.drumPitchSpeedLinked[def.id] ?? true;
+  drawChainLinkWithLines(C.chainX, C.chainY, C.pitchSliderY, C.speedSliderY, C.chainX + 5, linked, odef, !isMapped);
+
+  // Pitch slider
+  drawPanelSlider(odef, C.sliderX, C.pitchSliderY, C.sliderW, 'pitch', slot.drumPitch[def.id]??0, -12, 12, hasCandidates, !isMapped);
+
+  // Speed slider
+  const speedVal = linked ? Math.pow(2, (slot.drumPitch[def.id]??0)/12) : (slot.drumSpeed[def.id]??1.0);
+  drawPanelSlider(odef, C.sliderX, C.speedSliderY, C.sliderW, 'speed', speedVal, 0.5, 2.0, hasCandidates, !isMapped);
+
+  // Text input area + mode icons — first row spans full panel width
+  const finalized = !!slot.padFinalized[def.id];
+  const inputY = C.ctrlY;
+  const inputH = C.inputRowH - 4;
+  const hasTranscript = slot.transcriptLoaded && slot.lyricsTranscript.length > 0;
+  const hasResults = slot.analyzeResults && Object.keys(slot.analyzeResults).length > 0;
+  const hasClassic = hasResults && availablePrototypes.length > 0;
+  const hasSource = !!slot.sourceBuffer;
+
+  // Horizontal icon layout: all 6 icons right-aligned, textbox fills remaining space
+  const iconW = 14;
+  const iconCy = inputY + inputH / 2;
+  const iconsTotal = 6 * iconW;  // no gaps between icons
+  const iconsPadR = 4;  // padding from right panel edge
+  const iconsRightEdge = L.panelX + L.panelW - iconsPadR;
+  const iconsLeftEdge = iconsRightEdge - iconsTotal;
+  const inputX = C.rowX;
+  const inputW = iconsLeftEdge - inputX - 2;
+  const padText = (slot.padText[def.id] || '').trim();
+
+  // Check if there are unmapped pads available (for duplicate icon)
+  const unmappedPadAvailable = slot.activePadIds.some(pid => {
+    return pid !== def.id && !slot.padMode[pid] && !(slot.drumCandidates[pid] && slot.drumCandidates[pid].length > 0);
+  });
+
+  // Draw icons left to right, right-aligned
+  let iconCurX = iconsLeftEdge;
+
+  // Classic (drum) icon — grayed when no results/prototypes
+  {
+    const cx = iconCurX + iconW / 2;
+    const enabled = hasClassic;
+    const classicOpen = slot.padMenuOpen[def.id] === 'classic';
+    const cHov = enabled && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2;
+    const col = cHov||classicOpen ? ACCENT : (enabled ? INK_FAINT : [...INK_FAINT, 30]);
+    push(); translate(cx, iconCy);
+    const rw=5, rh=2, bodyH=5;
+    fill(col); noStroke();
+    ellipse(0, bodyH/2, rw*2, rh*2);
+    rect(-rw, -bodyH/2, rw*2, bodyH);
+    drawingContext.save();
+    drawingContext.globalCompositeOperation = 'destination-out';
+    fill(0,0,0,100); noStroke();
+    ellipse(0, -bodyH/2, rw*2-1, rh*2-0.5);
+    drawingContext.restore();
+    noFill(); stroke(col); strokeWeight(0.7);
+    ellipse(0, -bodyH/2, rw*2, rh*2);
+    noFill(); strokeWeight(0.9);
+    line(1, -bodyH/2, rw+3, -bodyH/2-4);
+    fill(col); noStroke();
+    circle(1, -bodyH/2, 1.5);
+    pop();
+    if (cHov) cursor(HAND);
+    iconCurX += iconW;
+  }
+
+  // Transcript icon — grayed when no transcript
+  {
+    const cx = iconCurX + iconW / 2;
+    const enabled = hasTranscript;
+    const tHov = enabled && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2;
+    const col = tHov ? ACCENT : (enabled ? INK_FAINT : [...INK_FAINT, 30]);
+    push(); translate(cx, iconCy);
+    noFill(); stroke(col); strokeWeight(0.8); strokeJoin(ROUND);
+    const pw=9, ph=10, fold=2.5;
+    beginShape();
+    vertex(-pw/2, -ph/2); vertex(pw/2-fold, -ph/2); vertex(pw/2, -ph/2+fold);
+    vertex(pw/2, ph/2); vertex(-pw/2, ph/2);
+    endShape(CLOSE);
+    line(pw/2-fold, -ph/2, pw/2-fold, -ph/2+fold);
+    line(pw/2-fold, -ph/2+fold, pw/2, -ph/2+fold);
+    strokeWeight(0.6);
+    line(-pw/2+1.5, -ph/2+3.5, pw/2-fold-1, -ph/2+3.5);
+    line(-pw/2+1.5, -ph/2+5.5, pw/2-2, -ph/2+5.5);
+    line(-pw/2+1.5, -ph/2+7.5, pw/2-3, -ph/2+7.5);
+    pop();
+    if (tHov) cursor(HAND);
+    iconCurX += iconW;
+  }
+
+  // Freestyle [ ] icon — grayed when no source
+  {
+    const cx = iconCurX + iconW / 2;
+    const enabled = hasSource;
+    const fHov = enabled && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2;
+    const col = fHov ? ACCENT : (enabled ? INK_FAINT : [...INK_FAINT, 30]);
+    push(); translate(cx, iconCy);
+    noFill(); stroke(col); strokeWeight(1.0); strokeCap(SQUARE);
+    const bw = 3.5, bh = 6;
+    line(-bw - 1, -bh, -1, -bh);
+    line(-bw - 1, -bh, -bw - 1, bh);
+    line(-bw - 1, bh, -1, bh);
+    line(1, -bh, bw + 1, -bh);
+    line(bw + 1, -bh, bw + 1, bh);
+    line(1, bh, bw + 1, bh);
+    pop();
+    if (fHov) cursor(HAND);
+    iconCurX += iconW;
+  }
+
+  // Cycle icon (↻) with i/N below — grayed when <= 1 candidate
+  {
+    const cx = iconCurX + iconW / 2;
+    const enabled = cands.length > 1;
+    const swpHov = enabled && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2;
+    const col = swpHov ? ACCENT : (enabled ? INK_FAINT : [...INK_FAINT, 30]);
+    fill(col); noStroke();
+    textSize(9); textAlign(CENTER, CENTER);
+    text('\u21bb', cx, iconCy - 3);
+    if (enabled) {
+      const idx = (slot.drumIdx[def.id]||0)+1;
+      textSize(4); textAlign(CENTER, CENTER);
+      fill(col);
+      text(idx+'/'+cands.length, cx, iconCy + 6);
+    }
+    if (swpHov) cursor(HAND);
+    iconCurX += iconW;
+  }
+
+  // Duplicate icon — two overlapping rectangles with + — grayed when no unmapped pad or not mapped
+  {
+    const cx = iconCurX + iconW / 2;
+    const enabled = isMapped && unmappedPadAvailable;
+    const dHov = enabled && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2;
+    const col = dHov ? ACCENT : (enabled ? INK_FAINT : [...INK_FAINT, 30]);
+    push(); translate(cx, iconCy);
+    noFill(); stroke(col); strokeWeight(0.8); strokeJoin(ROUND);
+    const rSz = 6, off = 2.5;
+    // Back rectangle (offset up-right)
+    rect(-rSz/2 + off, -rSz/2 - off, rSz, rSz, 1);
+    // Front rectangle
+    rect(-rSz/2 - off/2, -rSz/2 + off/2, rSz, rSz, 1);
+    // Plus in front rectangle
+    strokeWeight(1.0);
+    const pSz = 2;
+    const pcx = -off/2, pcy = off/2;
+    line(pcx - pSz, pcy, pcx + pSz, pcy);
+    line(pcx, pcy - pSz, pcx, pcy + pSz);
+    pop();
+    if (dHov) cursor(HAND);
+    iconCurX += iconW;
+  }
+
+  // Trash icon — grayed when pad is unmapped
+  {
+    const cx = iconCurX + iconW / 2;
+    const enabled = isMapped;
+    const tHov = enabled && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2;
+    const col = tHov ? ACCENT : (enabled ? INK_FAINT : [...INK_FAINT, 30]);
+    push(); translate(cx, iconCy);
+    noFill(); stroke(col); strokeWeight(0.8); strokeJoin(ROUND);
+    // Lid
+    const tw = 8, th = 9, lidH = 2, handleW = 3;
+    line(-tw/2, -th/2 + lidH, tw/2, -th/2 + lidH);  // lid bottom
+    line(-handleW/2, -th/2 + lidH, -handleW/2, -th/2);  // handle left
+    line(-handleW/2, -th/2, handleW/2, -th/2);  // handle top
+    line(handleW/2, -th/2, handleW/2, -th/2 + lidH);  // handle right
+    // Body (slight taper)
+    const bodyTop = -th/2 + lidH + 0.5;
+    const bodyBot = th/2;
+    const topW = tw/2 - 0.5, botW = tw/2 - 1.5;
+    line(-topW, bodyTop, -botW, bodyBot);
+    line(topW, bodyTop, botW, bodyBot);
+    line(-botW, bodyBot, botW, bodyBot);
+    // Vertical lines inside
+    strokeWeight(0.5);
+    line(-1.5, bodyTop + 1.5, -1.5, bodyBot - 1);
+    line(0, bodyTop + 1.5, 0, bodyBot - 1);
+    line(1.5, bodyTop + 1.5, 1.5, bodyBot - 1);
+    pop();
+    if (tHov) cursor(HAND);
+    iconCurX += iconW;
+  }
+
+  // X inside the text input (right edge) when finalized — clears text
+  if (finalized && padText) {
+    const xX = inputX + inputW - 10;
+    const xY = inputY + inputH/2;
+    const xHov = dist(mX(), mY(), xX, xY) < 7;
+    push(); strokeCap(ROUND); noFill();
+    stroke(xHov ? RED : INK_FAINT); strokeWeight(0.8);
+    const s = 2.5;
+    line(xX-s, xY-s, xX+s, xY+s);
+    line(xX+s, xY-s, xX-s, xY+s);
+    pop();
+    if (xHov) cursor(HAND);
+  }
+
+  // Divider line between text/icon row and sliders/EQ row
+  stroke(...INK_FAINT); strokeWeight(0.5);
+  line(L.panelX + 4, C.dividerY, L.panelX + L.panelW - 4, C.dividerY);
+
+  // Inline EQ graph — always shown, grayed when unmapped
+  drawInlineEQ(odef, C, slot, def.id, !isMapped);
+
+  // Classic sub-menu: rendered last so it paints on top of other controls
+  if (hasClassic && slot.padMenuOpen[def.id] === 'classic') {
+    // Position below the classic icon (first icon after textbox)
+    const classicIconX = iconsLeftEdge;
+    const menuY = inputY + inputH + 3;
+    const menuX = classicIconX - 2;
+    // Background panel
+    textSize(5);
+    let totalW = 0;
+    for (const p of availablePrototypes) totalW += textWidth(p) + 8 + 2;
+    totalW -= 2; // remove last gap
+    const menuH = 14;
+    fill(...PANEL); stroke(...INK_FAINT); strokeWeight(0.5);
+    rect(menuX - 2, menuY - 2, totalW + 4, menuH + 4, 3);
+    let px = menuX;
+    for (const p of availablePrototypes) {
+      const pw = textWidth(p) + 8;
+      const pHov = mX()>px && mX()<px+pw && mY()>menuY && mY()<menuY+menuH;
+      fill(pHov ? ACCENT : PANEL); stroke(...INK_FAINT); strokeWeight(0.5);
+      rect(px, menuY, pw, menuH, 2);
+      fill(pHov ? [0,0,100] : INK_DIM); noStroke(); textSize(5); textAlign(CENTER, CENTER);
+      text(p, px+pw/2, menuY+menuH/2);
+      if (pHov) cursor(HAND);
+      px += pw + 2;
+    }
+  }
 }
+
+
+// ── Inline EQ ─────────────────────────────────────────────────────────────────
+
+function eqFreqToX(freq, gx, gw) {
+  return gx + (Math.log(freq/20) / Math.log(1000)) * gw;
+}
+
+function eqGainToY(gain, gy, gh) {
+  return gy + gh/2 - (gain / EQ_GAIN_RANGE) * (gh/2);
+}
+
+function drawInlineEQ(drum, C, slot, padId, dimmed) {
+  const eq = slot.drumEQ[padId] || { low: 0, mid: 0, high: 0 };
+  const gx = C.eqGraphX, gy = C.eqGraphY, gw = C.eqGraphW, gh = C.eqGraphH;
+
+  // Graph background
+  fill(...SEQ_CELL); stroke(dimmed ? [...INK_FAINT, 40] : INK_FAINT); strokeWeight(0.5);
+  rect(gx, gy, gw, gh, 2);
+
+  // Grid lines — 0dB center
+  stroke(...INK_FAINT, dimmed ? 15 : 30); strokeWeight(0.5);
+  line(gx, gy + gh/2, gx + gw, gy + gh/2);
+  for (const g of [-12, -6, 6, 12]) {
+    const ly = eqGainToY(g, gy, gh);
+    line(gx, ly, gx + gw, ly);
+  }
+  for (const f of [100, 1000, 10000]) {
+    const lx = eqFreqToX(f, gx, gw);
+    line(lx, gy, lx, gy + gh);
+  }
+
+  // Frequency labels
+  fill(dimmed ? [...INK_FAINT, 30] : INK_FAINT); noStroke(); textSize(4); textAlign(CENTER, TOP);
+  for (const [f, label] of [[100,'100'], [1000,'1k'], [10000,'10k']]) {
+    text(label, eqFreqToX(f, gx, gw), gy + gh + 1);
+  }
+  // Gain labels
+  textAlign(RIGHT, CENTER);
+  for (const g of [-12, 0, 12]) {
+    text((g>0?'+':'')+g, gx - 2, eqGainToY(g, gy, gh));
+  }
+
+  // Frequency response curve
+  noFill(); stroke(drum.hue, dimmed ? 10 : DRUM_S, dimmed ? 90 : DRUM_B); strokeWeight(1.2);
+  beginShape();
+  const nPts = EQ_CURVE_FREQS.length;
+  for (let i = 0; i < nPts; i++) {
+    const f = EQ_CURVE_FREQS[i];
+    let gain = 0;
+    gain += eq.low * (1 / (1 + Math.pow(f / EQ_LOW_FREQ, 2)));
+    const midRatio = f / EQ_MID_FREQ;
+    gain += eq.mid * (1 / (1 + EQ_MID_Q * Math.pow(midRatio - 1/midRatio, 2)));
+    gain += eq.high * (1 / (1 + Math.pow(EQ_HIGH_FREQ / f, 2)));
+    const px = eqFreqToX(f, gx, gw);
+    const py = eqGainToY(gain, gy, gh);
+    vertex(px, constrain(py, gy, gy + gh));
+  }
+  endShape();
+
+  // Anchor points
+  const anchors = [
+    { freq: EQ_LOW_FREQ, gain: eq.low, band: 'low' },
+    { freq: EQ_MID_FREQ, gain: eq.mid, band: 'mid' },
+    { freq: EQ_HIGH_FREQ, gain: eq.high, band: 'high' },
+  ];
+  for (const a of anchors) {
+    const ax = eqFreqToX(a.freq, gx, gw);
+    const ay = eqGainToY(a.gain, gy, gh);
+    const hov = !dimmed && dist(mX(), mY(), ax, ay) < 8;
+    const dragging = !dimmed && drag && drag.type === 'eqBand' && drag.band === a.band;
+    fill(dragging || hov ? [drum.hue, DRUM_S, DRUM_B] : PANEL);
+    stroke(drum.hue, dimmed ? 10 : DRUM_S, dimmed ? 90 : DRUM_B); strokeWeight(0.8);
+    circle(ax, ay, dragging || hov ? 7 : 5);
+    if (hov) cursor(HAND);
+  }
+}
+
+/** Compute consistent control positions within the panel. Used by render + input. */
+function panelControlLayout(L) {
+  const inputRowH = 24;  // height reserved for text input + icons row
+  const ctrlY = L.panelY + TRIM_H + 4;
+  const ctrlH = L.panelH - TRIM_H - 8;
+  const dividerY = ctrlY + inputRowH;  // line between text row and sliders/EQ row
+
+  // Text/icon row spans full panel width
+  const rowX = L.panelX + 8;
+  const rowW = L.panelW - 16;
+
+  // Slider box — left portion below the text row
+  const sliderBoxPad = 4;
+  const sliderBoxX = L.panelX + 8;
+  const sliderBoxW = CTRL_PANEL_MIN_W - 16;
+  const labelPadL = 35;   // space for labels (VOL, PITCH, SPEED) — includes chain bracket zone
+  const labelPadR = 24;   // space for values on right
+  const sliderW = sliderBoxW - sliderBoxPad * 2 - labelPadL - labelPadR;
+  // Three stacked horizontal sliders: VOL, PITCH, SPEED
+  const sliderRowH = 16;   // vertical space per slider row
+  const sliderBoxH = sliderRowH * 3 + sliderBoxPad * 2;
+  const sliderBoxY = dividerY + 4;  // below divider
+  const volSliderY = sliderBoxY + sliderBoxPad + sliderRowH / 2;
+  const pitchSliderY = volSliderY + sliderRowH;
+  const speedSliderY = pitchSliderY + sliderRowH;
+  const chainY = (pitchSliderY + speedSliderY) / 2;
+  const sliderX = sliderBoxX + sliderBoxPad + labelPadL;
+  const chainX = sliderBoxX + sliderBoxPad;  // chain icon near left edge of label zone
+
+  // Inline EQ graph — right of sliders, same height as slider box
+  const eqPad = 8;
+  const eqGraphX = L.panelX + CTRL_PANEL_MIN_W + eqPad;
+  const eqGraphY = sliderBoxY;
+  const eqGraphW = L.panelW - CTRL_PANEL_MIN_W - eqPad * 2;
+  const eqGraphH = sliderBoxH;
+  return { ctrlY, ctrlH, dividerY, inputRowH, sliderW, sliderX,
+    volSliderY, pitchSliderY, speedSliderY, chainX, chainY,
+    sliderBoxX, sliderBoxY, sliderBoxW, sliderBoxH, rowX, rowW,
+    eqGraphX, eqGraphY, eqGraphW, eqGraphH };
+}
+
+function speedToNorm(spd) { return constrain((Math.log2(spd) + 1) / 2, 0, 1); }
+function normToSpeed(n) { return Math.pow(2, n * 2 - 1); }
+
+function drawPanelSlider(drum, x, y, w, param, val, vmin, vmax, hasCandidates, dimmed) {
+  const normVal = param === 'speed' ? speedToNorm(val) : constrain((val-vmin)/(vmax-vmin), 0, 1);
+  const handleX = x + normVal * w;
+  const hov = !dimmed && abs(mX()-handleX)<6 && abs(mY()-y)<8;
+
+  // Track
+  stroke(dimmed ? [...INK_FAINT, 40] : INK_FAINT); strokeWeight(1);
+  line(x, y, x+w, y);
+
+  // Fill
+  if (hasCandidates) {
+    stroke(drum.hue, hov?50:(dimmed?20:DRUM_S), hov?70:(dimmed?80:DRUM_B)); strokeWeight(2);
+    if (param === 'pitch' || param === 'speed') {
+      const midX = x + w/2;
+      if (handleX >= midX) line(midX, y, handleX, y);
+      else line(handleX, y, midX, y);
+    } else {
+      line(x, y, handleX, y);
+    }
+  }
+
+  // Handle
+  fill(hov ? ACCENT : (dimmed ? SEQ_CELL : PANEL)); stroke(dimmed ? [...INK_FAINT, 40] : INK_FAINT); strokeWeight(1);
+  circle(handleX, y, 7);
+
+  // Label left
+  fill(dimmed ? [...INK_FAINT, 30] : (hasCandidates ? INK_DIM : INK_FAINT)); noStroke();
+  textSize(6); textAlign(RIGHT, CENTER);
+  const labels = { vol: 'VOL', pitch: 'PITCH', speed: 'SPEED' };
+  text(labels[param] || param, x - 6, y);
+
+  // Value right
+  textSize(6); textAlign(LEFT, CENTER);
+  if (dimmed) fill([...INK_FAINT, 30]);
+  if (param==='vol') text(Math.round(val*100)+'%', x+w+4, y);
+  else if (param==='pitch') text((val>0?'+':'')+val, x+w+4, y);
+  else text(Math.round(val*100)+'%', x+w+4, y);
+
+  if (hov) cursor(HAND);
+}
+
+function drawChainLinkWithLines(cx, cy, pitchY, speedY, bracketRight, linked, drum, dimmed) {
+  const hov = !dimmed && abs(mX()-cx)<6 && abs(mY()-cy)<6;
+  const col = dimmed ? [...INK_FAINT, 20] : (linked ? [drum.hue, DRUM_S, DRUM_B] : [...INK_FAINT, 40]);
+
+  // Rectilinear connector lines from chain icon to pitch/speed label areas
+  const lineCol = dimmed ? [...INK_FAINT, 15] : (linked ? [drum.hue, 20, DRUM_B] : [...INK_FAINT, 25]);
+  stroke(lineCol); strokeWeight(0.7); noFill();
+  // Top connector: up from chain to pitch row, then right
+  line(cx, cy - 3.5, cx, pitchY); line(cx, pitchY, bracketRight, pitchY);
+  // Bottom connector: down from chain to speed row, then right
+  line(cx, cy + 3.5, cx, speedY); line(cx, speedY, bracketRight, speedY);
+
+  // Chain link icon — rotated 90° (vertical) and scaled 50% from the original
+  // Rotated 90°: swap w/h → each link is 2 wide × 3.5 tall
+  const lkW = 2, lkH = 3.5, r = 0.75, sw = 0.8;
+  const overlap = 1.25;
+
+  // p5's scale(UI_SCALE) is already active, so use logical coords directly
+  const dc = drawingContext;
+  dc.save();
+  dc.lineWidth = sw;
+  dc.lineJoin = 'round';
+  const [h2, sl, ll] = hsbToHsl(col[0]||0, col[1]||0, col[2]||0);
+  const alpha = col.length === 4 ? col[3] / 100 : 1;
+  dc.strokeStyle = `hsla(${h2},${sl}%,${ll}%,${alpha})`;
+  dc.fillStyle = 'none';
+
+  function rrPath(x, y, w, h, r) {
+    dc.moveTo(x+r, y);
+    dc.lineTo(x+w-r, y); dc.arcTo(x+w, y, x+w, y+r, r);
+    dc.lineTo(x+w, y+h-r); dc.arcTo(x+w, y+h, x+w-r, y+h, r);
+    dc.lineTo(x+r, y+h); dc.arcTo(x, y+h, x, y+h-r, r);
+    dc.lineTo(x, y+r); dc.arcTo(x, y, x+r, y, r);
+    dc.closePath();
+  }
+
+  if (linked) {
+    const topY = cy - lkH + overlap/2;
+    const botY = cy - overlap/2;
+    const lkX = cx - lkW/2;
+
+    dc.beginPath(); rrPath(lkX, botY, lkW, lkH, r); dc.stroke();
+    dc.beginPath(); rrPath(lkX, topY, lkW, lkH, r); dc.stroke();
+
+    // Interlock illusion: erase crossing segments with bg color, redraw correct z-order
+    const bgHsl = hsbToHsl(...SEQ_CELL);
+    dc.strokeStyle = `hsl(${SEQ_CELL[0]},${bgHsl[1]}%,${bgHsl[2]}%)`;
+    dc.lineWidth = sw + 1.2;
+    dc.beginPath();
+    dc.moveTo(lkX, botY - 0.3);
+    dc.lineTo(lkX, botY + r + 0.3);
+    dc.stroke();
+    dc.beginPath();
+    dc.moveTo(lkX + lkW, botY - 0.3);
+    dc.lineTo(lkX + lkW, botY + r + 0.3);
+    dc.stroke();
+
+    dc.strokeStyle = `hsla(${h2},${sl}%,${ll}%,${alpha})`;
+    dc.lineWidth = sw;
+    // Bottom link's top-left in front
+    dc.beginPath();
+    dc.moveTo(lkX + r, botY);
+    dc.arcTo(lkX, botY, lkX, botY + r, r);
+    dc.lineTo(lkX, botY + lkH - r);
+    dc.stroke();
+    // Top link's bottom-right in front
+    dc.beginPath();
+    dc.moveTo(lkX + lkW - r, topY + lkH);
+    dc.arcTo(lkX + lkW, topY + lkH, lkX + lkW, topY + lkH - r, r);
+    dc.lineTo(lkX + lkW, topY + r);
+    dc.stroke();
+  } else {
+    const gap = 1;
+    const topY = cy - lkH - gap/2;
+    const botY = cy + gap/2;
+    const lkX = cx - lkW/2;
+    dc.beginPath(); rrPath(lkX, topY, lkW, lkH, r); dc.stroke();
+    dc.beginPath(); rrPath(lkX, botY, lkW, lkH, r); dc.stroke();
+  }
+
+  dc.restore();
+  if (hov) cursor(HAND);
+}
+
+
+function drawPanelTrimBar(drum, x, y, w, slot) {
+  const h = TRIM_H;
+  const hasCandidates = slot.drumCandidates[drum.id] && slot.drumCandidates[drum.id].length>0;
+  const curCand = hasCandidates ? slot.drumCandidates[drum.id][slot.drumIdx[drum.id]] : null;
+  fill(BG[0], 6, 100); stroke(drum.hue, 12, 82); strokeWeight(0.5);
+  rect(x, y, w, h, CORNER_RADIUS, CORNER_RADIUS, 0, 0);
+  if (!hasCandidates || !curCand) return;
+
+  let channel;
+  if (curCand.buffer) { channel = curCand.buffer.getChannelData(0); }
+  else if (slot.sourceBuffer) {
+    const sr = slot.sourceBuffer.sampleRate;
+    const sampleStart = Math.max(0, Math.floor((curCand.ctxStart||0)*sr));
+    const sampleEnd = Math.min(slot.sourceBuffer.length, Math.ceil((curCand.ctxEnd||1)*sr));
+    channel = slot.sourceBuffer.getChannelData(0).subarray(sampleStart, sampleEnd);
+  }
+  if (!channel) return;
+
+  const ts = slot.drumTrimStart[drum.id]||0, te = slot.drumTrimEnd[drum.id]??1;
+  const activeDrag = drag && (drag.type==='trimStart'||drag.type==='trimEnd') && drag.id===drum.id;
+  let dispStart = ts, dispEnd = te, shrinkHandleFrac = null;
+
+  if (activeDrag) {
+    const ps = drag.proposedStart??ts, pe = drag.proposedEnd??te;
+    const extending = (drag.type==='trimStart') ? (ps<ts) : (pe>te);
+    if (extending) { dispStart=ps; dispEnd=pe; }
+    else {
+      if (drag.type==='trimStart') shrinkHandleFrac=(ps-ts)/(te-ts);
+      else shrinkHandleFrac=(pe-ts)/(te-ts);
+    }
+  }
+
+  const dispLen = dispEnd - dispStart;
+  if (dispLen > 0.001) {
+    for (let px=0; px<w; px++) {
+      const ctxFrac = dispStart + (px/w) * dispLen;
+      const sampleIdx = Math.floor(constrain(ctxFrac,0,1)*(channel.length-1));
+      const step = max(1, Math.floor(dispLen*channel.length/w));
+      let peak = 0;
+      for (let s2=sampleIdx; s2<min(sampleIdx+step,channel.length); s2++) peak=max(peak,abs(channel[s2]));
+      const barHeight = peak*(h-4)*0.9;
+      let inActive = true;
+      if (shrinkHandleFrac !== null) {
+        const barFrac = px/w;
+        if (drag.type==='trimStart') inActive = barFrac>=shrinkHandleFrac;
+        else inActive = barFrac<=shrinkHandleFrac;
+      }
+      stroke(drum.hue, inActive?DRUM_S:22, inActive?DRUM_B:80); strokeWeight(1);
+      line(x+px, y+h/2-barHeight/2, x+px, y+h/2+barHeight/2);
+    }
+    if (shrinkHandleFrac !== null) {
+      noStroke(); fill(...BG, 55);
+      if (drag.type==='trimStart') rect(x+1, y+1, shrinkHandleFrac*(w-2), h-2);
+      else rect(x+1+shrinkHandleFrac*(w-2), y+1, (1-shrinkHandleFrac)*(w-2), h-2);
+    }
+  }
+
+  // Edge handles
+  const overTrimBar = mX()>x && mX()<x+w && mY()>y && mY()<y+h;
+  const nearLeft = abs(mX()-x)<8 && overTrimBar && !activeDrag;
+  const nearRight = abs(mX()-(x+w))<8 && overTrimBar && !activeDrag;
+  if (shrinkHandleFrac !== null) {
+    const hx = x + shrinkHandleFrac*w;
+    fill(drum.hue, 80, 65); noStroke(); rect(hx-1.5, y, 3, h, 1);
+  }
+  fill(drum.hue, nearLeft?80:DRUM_S, nearLeft?65:DRUM_B); noStroke(); rect(x, y, 3, h, 1);
+  fill(drum.hue, nearRight?80:DRUM_S, nearRight?65:DRUM_B); rect(x+w-3, y, 3, h, 1);
+  if (nearLeft||nearRight) cursor(HAND);
+}
+
+
+function keyReorderTargetIdx(mx, my, L, numPads) {
+  const oy = L.keysOffsetY || 0;
+  const kh = L.kh || KEY_H, kw = L.kw || KEY_W;
+  const row = my >= L.gridY + oy + kh + KEY_GAP*2 ? 1 : 0;
+  const offset = row === 1 ? KEY_ROW2_OFFSET : 0;
+  const col = Math.round((mx - L.gridX - offset) / (kw + KEY_GAP));
+  const rowStart = row * 8;
+  return constrain(rowStart + col, 0, numPads);
+}
+
 
 // ── Slot header helpers ──────────────────────────────────────────────────────
 
@@ -628,9 +1086,9 @@ function drawHeaderSlider(label, sliderX, sliderW, handleX, headerMid, valueText
   stroke(...INK_FAINT); strokeWeight(1); line(sliderX, sliderY, sliderX + sliderW, sliderY);
   fill(hov ? ACCENT : PANEL); stroke(...INK_FAINT); strokeWeight(1); circle(handleX, sliderY, 7);
   // Label centered below slider
-  fill(...INK); noStroke(); textSize(7); textAlign(CENTER, TOP);
+  fill(...INK); noStroke(); textSize(5); textAlign(CENTER, TOP);
   const labelText = valueText !== undefined ? label + ' ' + valueText : label;
-  text(labelText, sliderX + sliderW / 2, sliderY + 3);
+  text(labelText, sliderX + sliderW / 2, sliderY + 4);
 }
 
 /** Draw the compact [- NN +] step count stepper in a slot header. */
@@ -645,14 +1103,14 @@ function drawStepStepper(sx, sy, sw, sh, headerMid, steps) {
   fill(...PANEL); stroke(...INK_DIM); strokeWeight(1);
   rect(sx, sy, sw, sh, sh/2);
   // Minus
-  fill(minHov?ACCENT:INK_DIM); noStroke(); textSize(8); textAlign(CENTER,CENTER);
+  fill(minHov?ACCENT:INK_DIM); noStroke(); textSize(6); textAlign(CENTER,CENTER);
   text('\u2013', minusX+third/2, headerMid);
   // Number (hide when editing)
   if (!_stepEditInput||_stepEditInput.style.display==='none') {
-    fill(...INK); textSize(7); text(steps, numX+third/2, headerMid);
+    fill(...INK); textSize(5); text(steps, numX+third/2, headerMid);
   }
   // Plus
-  fill(plusHov?ACCENT:INK_DIM); textSize(8); text('+', plusX+third/2, headerMid);
+  fill(plusHov?ACCENT:INK_DIM); textSize(6); text('+', plusX+third/2, headerMid);
   // Dividers
   stroke(...INK_DIM); strokeWeight(1);
   line(numX, sy+2, numX, sy+sh-2);
@@ -679,7 +1137,7 @@ function drawMeasureTabs(slot, slotIndex, L, headerMid) {
       const xCx = tx + (tw - 1) / 2, xCy = tabY - 3;
       const xHov = mX() >= tx && mX() < tx + tw && effMouseY >= xCy - 4 && effMouseY < tabY;
       push(); strokeCap(ROUND); noFill();
-      stroke(xHov ? INK : INK_FAINT); strokeWeight(1.2);
+      stroke(xHov ? INK : INK_FAINT); strokeWeight(0.7);
       line(xCx - xS, xCy - xS, xCx + xS, xCy + xS);
       line(xCx + xS, xCy - xS, xCx - xS, xCy + xS);
       pop();
@@ -744,12 +1202,12 @@ function drawMeasureTabs(slot, slotIndex, L, headerMid) {
   }
 }
 
-/** Draw the C/D/S/M button capsule in a slot header. */
+/** Draw the S/M button capsule in a slot header. */
 function drawButtonCapsule(cx, cy, cellW, cellH, headerMid, slot) {
-  const labels=['C','D','S','M'];
-  const accents=[RED,ACCENT,ACCENT,RED];
-  const actives=[false,false,slot.soloed,slot.muted];
-  const n=4;
+  const labels=['S','M'];
+  const accents=[ACCENT,RED];
+  const actives=[slot.soloed,slot.muted];
+  const n=2;
   // Capsule outline
   fill(...PANEL); stroke(...INK_DIM); strokeWeight(1);
   rect(cx, cy, cellW*n, cellH, cellH/2);
@@ -758,18 +1216,17 @@ function drawButtonCapsule(cx, cy, cellW, cellH, headerMid, slot) {
     const x=cx+i*cellW;
     const hov=mX()>x&&mX()<x+cellW&&mY()>cy-seqScrollY&&mY()<cy+cellH-seqScrollY;
     if (hov||actives[i]) {
-      // Fill this cell with accent, clipping to capsule shape
       drawingContext.save();
       drawingContext.beginPath();
       const r=cellH/2;
-      const cLeft=cx+0.5, cTop=cy+0.5, cW=cellW*n-1, cH=cellH-1;
+      const cLeft=cx+0.5, cTop=cy+0.5, cW2=cellW*n-1, cH2=cellH-1;
       drawingContext.moveTo(cLeft+r,cTop);
-      drawingContext.lineTo(cLeft+cW-r,cTop);
-      drawingContext.arcTo(cLeft+cW,cTop,cLeft+cW,cTop+r,r);
-      drawingContext.lineTo(cLeft+cW,cTop+cH-r);
-      drawingContext.arcTo(cLeft+cW,cTop+cH,cLeft+cW-r,cTop+cH,r);
-      drawingContext.lineTo(cLeft+r,cTop+cH);
-      drawingContext.arcTo(cLeft,cTop+cH,cLeft,cTop+cH-r,r);
+      drawingContext.lineTo(cLeft+cW2-r,cTop);
+      drawingContext.arcTo(cLeft+cW2,cTop,cLeft+cW2,cTop+r,r);
+      drawingContext.lineTo(cLeft+cW2,cTop+cH2-r);
+      drawingContext.arcTo(cLeft+cW2,cTop+cH2,cLeft+cW2-r,cTop+cH2,r);
+      drawingContext.lineTo(cLeft+r,cTop+cH2);
+      drawingContext.arcTo(cLeft,cTop+cH2,cLeft,cTop+cH2-r,r);
       drawingContext.lineTo(cLeft,cTop+r);
       drawingContext.arcTo(cLeft,cTop,cLeft+r,cTop,r);
       drawingContext.closePath();
@@ -778,15 +1235,22 @@ function drawButtonCapsule(cx, cy, cellW, cellH, headerMid, slot) {
       rect(x, cy, cellW, cellH);
       drawingContext.restore();
     }
-    fill((hov||actives[i])?[0,0,98]:INK_DIM); noStroke(); textSize(7); textAlign(CENTER,CENTER);
+    fill((hov||actives[i])?[0,0,98]:INK_DIM); noStroke(); textSize(5); textAlign(CENTER,CENTER);
     text(labels[i], x+cellW/2, headerMid);
   }
-  // Divider lines between cells
+  // Divider line between cells
   stroke(...INK_DIM); strokeWeight(1);
-  for (let i=1; i<n; i++) {
-    const x=cx+i*cellW;
-    line(x, cy+2, x, cy+cellH-2);
-  }
+  line(cx+cellW, cy+2, cx+cellW, cy+cellH-2);
+}
+
+/** Draw a standalone text button (CLR / DUP). */
+function drawStandaloneBtn(x, y, w, h, label, headerMid, hoverColor) {
+  const hov=mX()>x&&mX()<x+w&&mY()>y-seqScrollY&&mY()<y+h-seqScrollY;
+  fill(hov?hoverColor:PANEL); stroke(...INK_DIM); strokeWeight(1);
+  rect(x, y, w, h, 3);
+  fill(hov?[0,0,98]:INK_DIM); noStroke(); textSize(5); textAlign(CENTER,CENTER);
+  text(label, x+w/2, headerMid);
+  if (hov) cursor(HAND);
 }
 
 /** Draw the standalone X (remove slot) button. */
@@ -811,7 +1275,7 @@ function drawSeqControlBar(ctrlY) {
   fill(...PANEL); stroke(...INK); strokeWeight(1);
   rect(SEQ_MARGIN,ctrlY,cW()-SEQ_MARGIN*2,SEQ_CTRL_H,CORNER_RADIUS,CORNER_RADIUS,0,0);
 
-  const playX=SEQ_MARGIN+SEQ_LABEL_W;
+  const playX=SEQ_MARGIN+12+12;
   const playRadius=12, playHov=dist(mX(),mY(),playX,ctrlMid)<playRadius;
   fill(seqPlaying?[120,55,70]:playHov?ACCENT:PANEL); stroke(...INK); strokeWeight(1); circle(playX,ctrlMid,playRadius*2);
   fill(seqPlaying?[0,0,98]:INK); noStroke();
@@ -838,10 +1302,6 @@ function drawSeqControlBar(ctrlY) {
   fill(tapHov?ACCENT:PANEL); stroke(...INK); strokeWeight(1); rect(tapX,ctrlMid-tapH/2,tapW,tapH,CORNER_RADIUS);
   fill(...INK); noStroke(); textSize(8); textAlign(CENTER,CENTER); text('TAP',tapX+tapW/2,ctrlMid);
 
-  const clrAllX=tapX+tapW+10, clrAllW=50, clrAllH=20;
-  const clrAllHov=mX()>clrAllX&&mX()<clrAllX+clrAllW&&mY()>ctrlMid-clrAllH/2&&mY()<ctrlMid+clrAllH/2;
-  fill(clrAllHov?RED:PANEL); stroke(...INK); strokeWeight(1); rect(clrAllX,ctrlMid-clrAllH/2,clrAllW,clrAllH,CORNER_RADIUS);
-  fill(clrAllHov?[0,0,98]:INK); noStroke(); textSize(8); textAlign(CENTER,CENTER); text('CLR ALL',clrAllX+clrAllW/2,ctrlMid);
 
   if (seqRecording) {
     fill(0,65,55,65+sin(frameCount*0.15)*18); textSize(8); textAlign(RIGHT,CENTER); noStroke();
@@ -856,7 +1316,7 @@ function drawSeqControlBar(ctrlY) {
 function drawGlobalMeasureTabs(ctrlMid) {
   const maxM = Math.max(...slots.map(s => s.grid.measures.length));
   if (maxM < 1) return;
-  const tw = 12, tabH = 10, r = 3;
+  const tw = 16, tabH = 14, r = 3;
   const lockW = 14;
   const totalW = maxM * tw + lockW;
   const baseX = cW() - SEQ_MARGIN - 8 - totalW - (seqRecording ? 42 : 0);
@@ -891,7 +1351,7 @@ function drawGlobalMeasureTabs(ctrlMid) {
 
     noStroke();
     fill(isEdit || isPlaying ? (disabled ? [...INK_DIM] : [0, 0, 100]) : INK_DIM);
-    textSize(6); textAlign(CENTER, CENTER);
+    textSize(8); textAlign(CENTER, CENTER);
     text(i + 1, tx + (tw - 1) / 2, tabMidY);
     if (hov) cursor(HAND);
   }
@@ -997,6 +1457,8 @@ function drawSlotHeader(slot, slotIndex, slotGridTopY, seqRowHeight, numSeqRows)
   const stepY=headerY+(SLOT_HDR_H-L.stepH)/2;
   drawStepStepper(L.stepX, stepY, L.stepW, L.stepH, headerMid, slot.grid.steps);
 
+  drawStandaloneBtn(L.clrX, btnY, L.standaloneW, L.btnH, 'CLR', headerMid, RED);
+  drawStandaloneBtn(L.dupX, btnY, L.standaloneW, L.btnH, 'DUP', headerMid, ACCENT);
   drawButtonCapsule(L.capsuleX, btnY, L.capsuleCellW, L.btnH, headerMid, slot);
   drawRemoveSlotBtn(L.removeX, btnY, L.removeW, L.btnH, headerMid, slots.length>1);
 }
@@ -1017,7 +1479,7 @@ function drawSlotGrid(slot, slotIndex, slotGridTopY, seqRowHeight, seqW, gridLef
 
   for (let step=0;step<grid.steps;step++) {
     const x0=gridLeft+stepPositions[step]*seqW, x1=gridLeft+stepPositions[step+1]*seqW;
-    fill(Math.floor(step/4)%2===0?[0,0,91]:[0,0,85]); noStroke();
+    fill(Math.floor(step/4)%2===0?SEQ_CELL:SEQ_CELL_ALT); noStroke();
     rect(x0,slotGridTopY+1,x1-x0-1,gridHeight-2);
   }
 
@@ -1025,10 +1487,14 @@ function drawSlotGrid(slot, slotIndex, slotGridTopY, seqRowHeight, seqW, gridLef
     const rowY=slotGridTopY+rowIndex*seqRowHeight;
     if (rowIndex>0) { stroke(0,0,58); strokeWeight(1); line(gridLeft,rowY,gridLeft+seqW,rowY); }
 
-    fill((slot.drumCandidates[drum.id]&&slot.drumCandidates[drum.id].length>0)?[dHue(drum.hue),DRUM_S,DRUM_B]:INK_FAINT);
+    const labelX=SEQ_MARGIN, labelW=SEQ_LABEL_W;
+    const effMouseYL=mY()+seqScrollY;
+    const labelHov=mX()>labelX&&mX()<labelX+labelW&&effMouseYL>rowY&&effMouseYL<rowY+seqRowHeight;
+    const hasCand=slot.drumCandidates[drum.id]&&slot.drumCandidates[drum.id].length>0;
+    fill(labelHov?[dHue(drum.hue),DRUM_S,DRUM_B]:(hasCand?[dHue(drum.hue),DRUM_S,DRUM_B]:INK_FAINT));
+    if (labelHov) { fill(dHue(drum.hue),DRUM_S+10,DRUM_B+5); cursor(HAND); }
     noStroke(); textSize(7); textAlign(RIGHT,CENTER);
-    const el=slot.padInputEls[drum.id];
-    const textValue=el?el.elt.value.trim():'';
+    const textValue=(slot.padText[drum.id]||'').trim();
     let rowLabel=textValue||padDisplayKey(drum.id);
     const maxLabelW=SEQ_LABEL_W-20;
     if (textWidth(rowLabel)>maxLabelW) {
@@ -1038,6 +1504,7 @@ function drawSlotGrid(slot, slotIndex, slotGridTopY, seqRowHeight, seqW, gridLef
     text(rowLabel,gridLeft-8,rowY+seqRowHeight/2);
 
     const ec=grid.measures[grid.editMeasure].cells;
+    const ecp=(grid.measures[grid.editMeasure].cellPitch)||{};
     for (let step=0;step<grid.steps;step++) {
       const x0=gridLeft+stepPositions[step]*seqW, x1=gridLeft+stepPositions[step+1]*seqW;
       const cellW=max(x1-x0,2);
@@ -1046,6 +1513,7 @@ function drawSlotGrid(slot, slotIndex, slotGridTopY, seqRowHeight, seqW, gridLef
       const effMouseY=mY()+seqScrollY;
       const cellHov=mX()>x0+1&&mX()<x0+cellW-1&&effMouseY>rowY+1&&effMouseY<rowY+seqRowHeight-1;
       const pad2=1.5;
+      const cp=on&&ecp[drum.id]?(ecp[drum.id][step]||0):0;
       if      (isHead&&on) fill(dHue(drum.hue),DRUM_S+8,DRUM_B+10);
       else if (isHead)     fill(dHue(drum.hue),DRUM_S_LITE,DRUM_B_LITE-10);
       else if (on)         fill(dHue(drum.hue),DRUM_S,DRUM_B,cellHov?100:90);
@@ -1053,6 +1521,24 @@ function drawSlotGrid(slot, slotIndex, slotGridTopY, seqRowHeight, seqW, gridLef
       else                 noFill();
       noStroke();
       if (on||isHead||cellHov) rect(x0+pad2,rowY+pad2,cellW-pad2*2,seqRowHeight-pad2*2,2);
+      // Per-cell pitch indicator
+      if (on && cellW >= 14) {
+        if (cp !== 0) {
+          // Show pitch value always when set
+          fill(0,0,100,80); noStroke();
+          textSize(min(6, seqRowHeight * 0.45)); textAlign(RIGHT, CENTER);
+          text((cp>0?'+':'')+cp, x0+cellW-3, rowY+seqRowHeight/2);
+        } else if (cellHov && !pickerOpen) {
+          // Show faint quarter note on hover
+          fill(0,0,100,35); noStroke();
+          textSize(min(8, seqRowHeight * 0.55)); textAlign(RIGHT, CENTER);
+          text('\u2669', x0+cellW-3, rowY+seqRowHeight/2);
+        }
+      } else if (on && cp !== 0 && cellW >= 6) {
+        // Narrow cell: small dot indicator for non-zero pitch
+        fill(0,0,100,60); noStroke();
+        circle(x0+cellW-3, rowY+3, 2);
+      }
       if (!on&&!isHead) {
         const isBeat=step%4===0;
         fill(dHue(drum.hue),28,isBeat?60:80,75); noStroke(); circle(x0+cellW/2,rowY+seqRowHeight/2,isBeat?3:1.8);
@@ -1070,6 +1556,28 @@ function drawSlotGrid(slot, slotIndex, slotGridTopY, seqRowHeight, seqW, gridLef
     stroke(...ACCENT,22); strokeWeight(6); line(scanX,slotGridTopY,scanX,slotGridTopY+gridHeight);
     stroke(...INK,60);    strokeWeight(1); line(scanX,slotGridTopY,scanX,slotGridTopY+gridHeight);
   }
+
+  // Seq label drag reorder insertion line
+  if (drag && drag.type==='reorderSeqLabel' && drag.triggered && drag.slotIdx===slotIndex) {
+    const tgt = seqLabelReorderTarget(drag, slotIndex, slotGridTopY, seqRowHeight);
+    if (tgt >= 0 && tgt <= numSeqRows) {
+      const lineY = slotGridTopY + tgt * seqRowHeight;
+      push(); stroke(205, 45, 62); strokeWeight(2); noFill();
+      line(SEQ_MARGIN, lineY, gridLeft, lineY);
+      pop();
+    }
+  }
+}
+
+/** Compute seq label reorder target row index (0 = before first, n = after last). */
+function seqLabelReorderTarget(dragState, slotIndex, slotGridTopY, seqRowHeight) {
+  const slot = slots[slotIndex];
+  const seqDrums = getSeqPads(slot);
+  const effY = dragState.currentY + seqScrollY;
+  for (let i = 0; i < seqDrums.length; i++) {
+    if (effY < slotGridTopY + i * seqRowHeight + seqRowHeight / 2) return i;
+  }
+  return seqDrums.length;
 }
 
 /** Draw the pill scrollbar to the right of the sequencer. */
@@ -1149,7 +1657,48 @@ function drawSequencer() {
   pop();
   drawingContext.restore();
 
+  // Cell pitch dropdown (rendered outside clip region so it's not clipped)
+  drawCellPitchDropdown();
+
   drawSeqScrollbar(gridTop, visibleHeight, seqRowHeight);
+}
+
+function drawCellPitchDropdown() {
+  if (!cellPitchDropdown) return;
+  const d = cellPitchDropdown;
+  const itemH = 13, menuW = 22;
+  const totalItems = 25; // +12 to -12
+  const totalH = totalItems * itemH;
+  const zeroIdx = 12; // index of the "0" item
+  // Center the "0" row on the cell's vertical center
+  const menuY = d.y + d.cellH / 2 - (zeroIdx + 0.5) * itemH;
+  const menuX = d.x + d.cellW / 2 - menuW / 2;
+  const clampedY = constrain(menuY, 2, cH() / UI_SCALE - totalH - 2);
+  const clampedX = constrain(menuX, 2, cW() / UI_SCALE - menuW - 2);
+
+  // Background
+  fill(...PANEL); stroke(...INK_FAINT); strokeWeight(0.5);
+  rect(clampedX - 2, clampedY - 2, menuW + 4, totalH + 4, 3);
+
+  for (let i = 0; i < totalItems; i++) {
+    const val = 12 - i;
+    const iy = clampedY + i * itemH;
+    const hov = mX() > clampedX && mX() < clampedX + menuW && mY() > iy && mY() < iy + itemH;
+    const isCur = (val === d.currentPitch);
+
+    if (isCur) { fill(...ACCENT); noStroke(); rect(clampedX, iy, menuW, itemH, 1); }
+    else if (hov) { fill(ACCENT[0], ACCENT[1], ACCENT[2], 25); noStroke(); rect(clampedX, iy, menuW, itemH, 1); }
+
+    if (val === 0) {
+      fill(isCur ? [0, 0, 100] : INK); strokeWeight(0.3); stroke(...INK_FAINT);
+      line(clampedX + 2, iy, clampedX + menuW - 2, iy);  // separator above 0
+      line(clampedX + 2, iy + itemH, clampedX + menuW - 2, iy + itemH); // separator below 0
+    }
+    fill(isCur ? [0, 0, 100] : (val === 0 ? INK : INK_DIM));
+    noStroke(); textSize(6); textAlign(CENTER, CENTER);
+    text(val === 0 ? '0' : (val > 0 ? '+' + val : '' + val), clampedX + menuW / 2, iy + itemH / 2);
+    if (hov) cursor(HAND);
+  }
 }
 
 // ── Overlays ─────────────────────────────────────────────────────────────────
@@ -1170,26 +1719,6 @@ function drawRecordingOverlay() {
   fill(...INK_DIM); textAlign(RIGHT,CENTER); textSize(8); text('R or \u25cf to stop',barX+barW-8,barY+barH/2);
 }
 
-function drawPadRecordingOverlay() {
-  const barW=min(420,cW()-80),barH=36,barX=(cW()-barW)/2,barY=HEADER_H+6;
-  fill(...PANEL,92); stroke(...INK,60); strokeWeight(1); rect(barX,barY,barW,barH,CORNER_RADIUS);
-  if (padRecAnalyser&&padRecWaveformData) {
-    padRecAnalyser.getByteTimeDomainData(padRecWaveformData);
-    stroke(0,65,50,80); strokeWeight(1.5); noFill(); beginShape();
-    for (let i=0;i<padRecWaveformData.length;i++)
-      vertex(barX+8+map(i,0,padRecWaveformData.length-1,0,barW-16),barY+map(padRecWaveformData[i],0,255,barH-4,4));
-    endShape();
-  }
-  const slot=currentSlot(), rec=slot.padRecorders[padRecordingId];
-  const elapsed=rec?((Date.now()-rec.startTime)/1000).toFixed(1):'0.0';
-  fill(0,70,62,70+sin(frameCount*0.15)*25); noStroke(); circle(barX+14,barY+barH/2,7);
-  fill(...INK); noStroke(); textSize(9); textAlign(LEFT,CENTER); text(elapsed+'s',barX+22,barY+barH/2);
-  const stopW=50, stopX=barX+barW-stopW-8, stopY=barY+4, stopH=barH-8;
-  const stopHov=mX()>stopX&&mX()<stopX+stopW&&mY()>stopY&&mY()<stopY+stopH;
-  fill(stopHov?RED:PANEL); stroke(...INK); strokeWeight(1); rect(stopX,stopY,stopW,stopH,3);
-  fill(stopHov?[0,0,98]:INK); noStroke(); textSize(8); textAlign(CENTER,CENTER); text('STOP',stopX+stopW/2,barY+barH/2);
-  if (stopHov) cursor(HAND);
-}
 
 
 function drawErrorOverlay() {
@@ -1252,8 +1781,10 @@ function drawTrimOverlay() {
   else if (inTrimRegion) cursor(MOVE);
 
   const selDur=trimEnd-trimStart;
+  const isCustomClip = trimState.mode === 'customClip';
   fill(...INK); noStroke(); textSize(8); textAlign(CENTER,TOP);
-  text('max 30s', cW()/2, HEADER_H+12);
+  if (!isCustomClip) text('max 30s', cW()/2, HEADER_H+12);
+  else text('select clip region', cW()/2, HEADER_H+12);
   textSize(8); textAlign(LEFT,TOP);
   text(selDur.toFixed(1)+'s selected', wfX, wfY+wfH+8);
   textAlign(RIGHT,TOP);
@@ -1276,7 +1807,7 @@ function drawTrimOverlay() {
   fill(isPlayingPreview||playHov?[0,0,98]:INK); noStroke(); textSize(8); textAlign(CENTER,CENTER);
   text(isPlayingPreview?'\u25a0 STOP':'\u25b6 PLAY', playBtnX+playBtnW/2, btnY+btnH/2);
 
-  const upLabel='UPLOAD '+selDur.toFixed(1)+'s';
+  const upLabel=(isCustomClip?'USE ':'UPLOAD ')+selDur.toFixed(1)+'s';
   textSize(8); const upW=max(80,textWidth(upLabel)+20);
   const upX=wfX+wfW-upW;
   const upHov=mX()>upX&&mX()<upX+upW&&mY()>btnY&&mY()<btnY+btnH;

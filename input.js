@@ -18,10 +18,11 @@ function setup() {
   uploadEl.changed(onFileSelected);
 
   pickerEl = document.createElement('div');
+  pickerEl.addEventListener('mousedown', e => e.stopPropagation());
   pickerEl.style.cssText = [
     'position:fixed','display:none','z-index:100',
     'background:rgba(248,244,236,0.97)',
-    'border:1px solid rgba(0,0,0,0.5)','border-radius:6px',
+    'border:1px solid rgba(0,0,0,0.5)',
     'box-shadow:0 4px 24px rgba(0,0,0,0.18)',
     'padding:10px 12px 12px','max-width:420px','min-width:220px',
     'max-height:340px','overflow-y:auto',
@@ -93,7 +94,7 @@ function _createDebugPanel() {
     'position:fixed','top:0','right:0','z-index:9999','display:none',
     'background:rgba(30,30,30,0.95)','color:#ccc','padding:10px 14px',
     "font-family:'IBM Plex Mono',monospace",'font-size:11px',
-    'width:240px','max-height:100vh','overflow-y:auto',
+    'width:500px','max-height:100vh','overflow-y:auto',
     'border-left:1px solid #555','user-select:none',
   ].join(';');
 
@@ -110,30 +111,43 @@ function _createDebugPanel() {
     ['DRUM_B_LITE', () => DRUM_B_LITE, v => { DRUM_B_LITE = v; _palette.DRUM_B_LITE = v; }, 0, 100],
   ];
 
-  let html = '<div style="font-size:13px;font-weight:bold;margin-bottom:8px">Debug: Colors</div>';
-
-  colorDefs.forEach(([name, arr]) => {
-    html += `<div style="margin-bottom:6px"><label style="display:block;margin-bottom:2px">${name}</label>`;
+  const sldW = 130;
+  function colorRow(name, arr) {
+    let s = `<div style="margin-bottom:5px"><label style="display:block;margin-bottom:1px;font-size:10px;font-weight:600">${name}</label>`;
     ['H','S','B'].forEach((ch, ci) => {
-      const max = ci === 0 ? 360 : 100;
-      html += `<span style="font-size:9px;width:12px;display:inline-block">${ch}</span>`;
-      html += `<input type="range" min="0" max="${max}" value="${arr[ci]}" data-color="${name}" data-idx="${ci}" style="width:140px;vertical-align:middle">`;
-      html += `<span class="dbg-val" data-color="${name}" data-idx="${ci}" style="font-size:9px;width:28px;display:inline-block;text-align:right">${arr[ci]}</span><br>`;
+      const mx = ci === 0 ? 360 : 100;
+      s += `<span style="font-size:9px;width:10px;display:inline-block">${ch}</span>`;
+      s += `<input type="range" min="0" max="${mx}" value="${arr[ci]}" data-color="${name}" data-idx="${ci}" style="width:${sldW}px;vertical-align:middle">`;
+      s += `<span class="dbg-val" data-color="${name}" data-idx="${ci}" style="font-size:9px;width:24px;display:inline-block;text-align:right">${arr[ci]}</span> `;
     });
-    html += '</div>';
-  });
+    s += '</div>';
+    return s;
+  }
 
-  html += '<div style="margin-top:8px;border-top:1px solid #555;padding-top:8px">';
+  // Two-column layout for colors
+  const half = Math.ceil(colorDefs.length / 2);
+  const colL = colorDefs.slice(0, half), colR = colorDefs.slice(half);
+  let html = '<div style="font-size:13px;font-weight:bold;margin-bottom:8px">Debug Panel</div>';
+  html += '<div style="display:flex;gap:16px">';
+  html += '<div style="flex:1">';
+  colL.forEach(([n, a]) => { html += colorRow(n, a); });
+  html += '</div><div style="flex:1">';
+  colR.forEach(([n, a]) => { html += colorRow(n, a); });
+  html += '</div></div>';
+
+  // Scalars row
+  html += '<div style="margin-top:6px;border-top:1px solid #555;padding-top:6px;display:flex;flex-wrap:wrap;gap:4px 16px">';
   scalarDefs.forEach(([name,,, mn, mx]) => {
     const val = name === 'DRUM_S' ? DRUM_S : name === 'DRUM_B' ? DRUM_B : name === 'DRUM_S_LITE' ? DRUM_S_LITE : DRUM_B_LITE;
-    html += `<label style="font-size:10px">${name}</label> `;
-    html += `<input type="range" min="${mn}" max="${mx}" value="${val}" data-scalar="${name}" style="width:120px;vertical-align:middle">`;
-    html += `<span class="dbg-val" data-scalar="${name}" style="font-size:9px;width:28px;display:inline-block;text-align:right">${val}</span><br>`;
+    html += `<div><label style="font-size:10px">${name}</label> `;
+    html += `<input type="range" min="${mn}" max="${mx}" value="${val}" data-scalar="${name}" style="width:80px;vertical-align:middle">`;
+    html += `<span class="dbg-val" data-scalar="${name}" style="font-size:9px;width:24px;display:inline-block;text-align:right">${val}</span></div>`;
   });
   html += '</div>';
 
-  html += '<div style="margin-top:8px;border-top:1px solid #555;padding-top:8px">';
-  html += '<label style="font-size:10px">Font</label> ';
+  // Font row
+  html += '<div style="margin-top:6px;border-top:1px solid #555;padding-top:6px;display:flex;gap:16px;align-items:center">';
+  html += '<div><label style="font-size:10px">Font</label> ';
   html += '<select id="dbg-font" style="font-size:10px;width:150px;background:#222;color:#ccc;border:1px solid #555">';
   ['Silkscreen','IBM Plex Mono','monospace','Inter','Arial','Courier New','Georgia',
    'Futura','Helvetica Neue','Palatino','Baskerville','Didot','Optima','Gill Sans',
@@ -145,13 +159,12 @@ function _createDebugPanel() {
   ].forEach(f => {
     html += `<option value="${f}" ${f===_debugFont?'selected':''}>${f}</option>`;
   });
-  html += '</select><br>';
-  html += '<label style="font-size:10px">Size offset</label> ';
-  html += `<input type="range" id="dbg-fontsize" min="-4" max="8" value="${_debugFontSize}" style="width:120px;vertical-align:middle">`;
-  html += `<span id="dbg-fontsize-val" style="font-size:9px">${_debugFontSize}</span>`;
+  html += '</select></div>';
+  html += '<div><label style="font-size:10px">Size offset</label> ';
+  html += `<input type="range" id="dbg-fontsize" min="-4" max="8" value="${_debugFontSize}" style="width:80px;vertical-align:middle">`;
+  html += `<span id="dbg-fontsize-val" style="font-size:9px">${_debugFontSize}</span></div>`;
+  html += '<div style="margin-left:auto"><button id="dbg-reset" style="font-size:10px;background:#444;color:#ccc;border:1px solid #666;padding:2px 8px;cursor:pointer">Reset</button></div>';
   html += '</div>';
-
-  html += '<div style="margin-top:8px;text-align:right"><button id="dbg-reset" style="font-size:10px;background:#444;color:#ccc;border:1px solid #666;padding:2px 8px;cursor:pointer">Reset</button></div>';
 
   panel.innerHTML = html;
   document.body.appendChild(panel);
@@ -212,13 +225,16 @@ function _createDebugPanel() {
     const fontSel = document.getElementById('dbg-font');
     if (fontSel) fontSel.value = 'Gill Sans';
     const fsEl = document.getElementById('dbg-fontsize');
-    if (fsEl) fsEl.value = 0;
+    if (fsEl) fsEl.value = 2;
     const fsVal = document.getElementById('dbg-fontsize-val');
-    if (fsVal) fsVal.textContent = '0';
+    if (fsVal) fsVal.textContent = '2';
   });
-  // Stop keyboard events from reaching p5
+  // Stop all events from reaching p5
   panel.addEventListener('keydown', e => e.stopPropagation());
   panel.addEventListener('keyup', e => e.stopPropagation());
+  panel.addEventListener('mousedown', e => e.stopPropagation());
+  panel.addEventListener('mouseup', e => e.stopPropagation());
+  panel.addEventListener('click', e => e.stopPropagation());
 }
 
 function windowResized() {
@@ -243,7 +259,7 @@ function onSlotHeaderClick() {
     const headerW=cW()-SEQ_MARGIN*2, headerRight=SEQ_MARGIN+headerW;
     if (!(effY>=headerY&&effY<headerY+SLOT_HDR_H&&mX()>=SEQ_MARGIN&&mX()<headerRight)) continue;
     const slot=slots[slotIndex];
-    const L=slotHeaderLayout(headerRight, slot.grid.measures.length);
+    const L=slotHeaderLayout(headerRight, slot.grid.measures.length, slot.type);
     const headerMid=headerY+SLOT_HDR_H/2;
     const screenMid=headerMid-seqScrollY; // screen-space Y for hit detection
     const volHandleX=L.volSliderX+(slot.gridVolume??1.0)*L.volSliderW;
@@ -368,14 +384,19 @@ function onSeqControlsClick() {
       }
     }
   }
-  // + seq big plus (in scrollable region)
+  // Two add-slot buttons: drum + melody (in scrollable region)
   const lastSlot=slots[slots.length-1];
   const lastGridTop=getSlotGridTop(slots.length-1,gridTop,seqRowHeight);
   const numLastRows=Math.max(1,getSeqPads(lastSlot).length);
-  const addSlotY=lastGridTop+numLastRows*seqRowHeight+20;
-  const addSlotCenterX=SEQ_MARGIN+SEQ_LABEL_W+seqW/2, addSlotCenterY=addSlotY+20;
+  const addSlotY=lastGridTop+numLastRows*slotRowHeight(lastSlot, seqRowHeight)+20;
+  const addSlotCenterY=addSlotY+20;
+  const addSlotGap=40;
+  const addSlotMidX=SEQ_MARGIN+SEQ_LABEL_W+seqW/2;
+  const addDrumX=addSlotMidX-addSlotGap/2-12;
+  const addMelodyX=addSlotMidX+addSlotGap/2+12;
   const effY=mY()+seqScrollY;
-  if (abs(mX()-addSlotCenterX)<24&&abs(effY-addSlotCenterY)<18&&mY()>=gridTop) { addSlot(); return true; }
+  if (abs(mX()-addDrumX)<18&&abs(effY-addSlotCenterY)<18&&mY()>=gridTop) { addSlot('drum'); return true; }
+  if (abs(mX()-addMelodyX)<18&&abs(effY-addSlotCenterY)<18&&mY()>=gridTop) { addSlot('melody'); return true; }
   return false;
 }
 
@@ -387,17 +408,25 @@ function onSeqLabelClick() {
   const effY=mY()+seqScrollY;
   for (let slotIndex=0; slotIndex<slots.length; slotIndex++) {
     const slot=slots[slotIndex];
+    const rowH=slotRowHeight(slot, seqRowHeight);
     const seqDrums=getSeqPads(slot), numSeqRows=seqDrums.length;
     const slotGridTopY=getSlotGridTop(slotIndex,gridTop,seqRowHeight);
-    if (effY<slotGridTopY||effY>slotGridTopY+numSeqRows*seqRowHeight) continue;
+    if (effY<slotGridTopY||effY>slotGridTopY+numSeqRows*rowH) continue;
     for (let rowIndex=0; rowIndex<seqDrums.length; rowIndex++) {
-      const rowY=slotGridTopY+rowIndex*seqRowHeight;
-      if (effY>=rowY&&effY<rowY+seqRowHeight) {
+      const rowY=slotGridTopY+rowIndex*rowH;
+      if (effY>=rowY&&effY<rowY+rowH) {
         const drum=seqDrums[rowIndex];
         selectSlot(slotIndex);
-        selectPad(drum.id);
-        drag={type:'reorderSeqLabel', slotIdx:slotIndex, padId:drum.id, seqRowIdx:rowIndex,
-              startX:mX(), startY:mY(), currentX:mX(), currentY:mY(), triggered:false};
+        if (slot.type !== 'melody') selectPad(drum.id);
+        // Melody rows are fixed pitch order — no reorder drag
+        if (slot.type === 'melody') {
+          // Preview the note on click
+          triggerMelodyNote(slot, drum.id);
+          padFlash[drum.id] = millis();
+        } else {
+          drag={type:'reorderSeqLabel', slotIdx:slotIndex, padId:drum.id, seqRowIdx:rowIndex,
+                startX:mX(), startY:mY(), currentX:mX(), currentY:mY(), triggered:false};
+        }
         return true;
       }
     }
@@ -412,34 +441,47 @@ function onSeqCellsClick() {
   if (mY()<gridTop) return;
   const effY=mY()+seqScrollY;
   slots.forEach((slot,slotIndex) => {
+    const rowH=slotRowHeight(slot, seqRowHeight);
     const seqDrums=getSeqPads(slot), numSeqRows=seqDrums.length;
     const slotGridTopY=getSlotGridTop(slotIndex,gridTop,seqRowHeight);
-    const grid=slot.grid, gridHeight=numSeqRows*seqRowHeight;
+    const grid=slot.grid, gridHeight=numSeqRows*rowH;
     if (effY<slotGridTopY||effY>slotGridTopY+gridHeight) return;
     if (mX()<gridLeft||mX()>gridLeft+seqW) return;
     const stepPositions=computeStepPositions(grid,slot);
     const stepIdx=posToStep((mX()-gridLeft)/seqW,stepPositions);
     if (stepIdx<0||stepIdx>=grid.steps) return;
     seqDrums.forEach((drum,rowIndex) => {
-      const rowY=slotGridTopY+rowIndex*seqRowHeight;
-      if (effY>=rowY&&effY<rowY+seqRowHeight) {
+      const rowY=slotGridTopY+rowIndex*rowH;
+      if (effY>=rowY&&effY<rowY+rowH) {
         selectSlot(slotIndex);
         const ec=editCells(slot);
         if (!ec[drum.id]) ec[drum.id]=new Array(grid.steps).fill(false);
         const isOn=ec[drum.id][stepIdx];
-        // Check for pitch icon click: right 30% of an ON cell with cellW >= 14
-        const cx0=gridLeft+stepPositions[stepIdx]*seqW, cx1=gridLeft+stepPositions[stepIdx+1]*seqW;
-        const cellW=cx1-cx0;
-        if (isOn && cellW >= 14 && (mX() - cx0) > cellW * 0.7) {
-          const ecp=editCellPitch(slot);
-          const curPitch=(ecp[drum.id]&&ecp[drum.id][stepIdx])||0;
-          cellPitchDropdown={slotIdx:slotIndex,padId:drum.id,stepIdx,x:cx0,y:rowY-seqScrollY,cellW,cellH:seqRowHeight,currentPitch:curPitch};
-          return;
+        // Check for pitch icon click: right 30% of an ON cell with cellW >= 14 (drum only)
+        if (slot.type !== 'melody') {
+          const cx0=gridLeft+stepPositions[stepIdx]*seqW, cx1=gridLeft+stepPositions[stepIdx+1]*seqW;
+          const cellW=cx1-cx0;
+          if (isOn && cellW >= 14 && (mX() - cx0) > cellW * 0.7) {
+            const ecp=editCellPitch(slot);
+            const curPitch=(ecp[drum.id]&&ecp[drum.id][stepIdx])||0;
+            drag={type:'cellPitch',slotIdx:slotIndex,padId:drum.id,stepIdx,startY:mY(),origPitch:curPitch,currentPitch:curPitch};
+            return;
+          }
         }
         const newVal=!isOn;
         ec[drum.id][stepIdx]=newVal;
-        if (newVal && !seqPlaying) triggerDrumAtTime(slot, drum.id, audioCtx.currentTime);
-        drag={type:'seqPaint',slotIdx:slotIndex,drumId:drum.id,seqW,gridLeft,gTop:slotGridTopY,seqRowHeight,rowIndex,value:newVal,lastS:stepIdx};
+        if (!newVal && slot.type !== 'melody') { const ecp=editCellPitch(slot); if(ecp[drum.id]) ecp[drum.id][stepIdx]=0; }
+        if (newVal && !seqPlaying) {
+          if (slot.type === 'melody') {
+            // Preview at correct pitch
+            const noteIdx = parseInt(drum.id.slice(1));
+            const cellPitch = noteIdx - MELODY_CENTER;
+            triggerDrumAtTime(slot, slot.melodySoundPadId, audioCtx.currentTime, cellPitch);
+          } else {
+            triggerDrumAtTime(slot, drum.id, audioCtx.currentTime);
+          }
+        }
+        drag={type:'seqPaint',slotIdx:slotIndex,drumId:drum.id,seqW,gridLeft,gTop:slotGridTopY,seqRowHeight:rowH,rowIndex,value:newVal,lastS:stepIdx};
       }
     });
   });
@@ -462,9 +504,40 @@ function onKeyGridClick() {
   if (slot.analyzing) return false;
 
   // Bounds check: is click in the grid area?
-  if (mX() < L.gridX || mX() > L.gridX + L.gridW || mY() < L.gridY || mY() > L.gridY + L.gridH) return false;
+  if (mX() < L.gridX || mX() > L.gridX + L.gridW || mY() < L.gridY || mY() > L.gridY + L.gridH + 20) return false;
 
-  // Hit test each key
+  // Melody keyboard hit test (uses same 2x8 pad grid as drum mode)
+  if (slot.type === 'melody') {
+    const kw = L.kw || KEY_W, kh = L.kh || KEY_H;
+
+    // Octave buttons
+    const oct = getMelodyOctaveLayout(L);
+    for (let i = 0; i < MELODY_OCTAVE_COUNT; i++) {
+      const bx = oct.octX + i * (oct.octBtnW + oct.octGap);
+      if (mX() > bx && mX() < bx + oct.octBtnW && mY() > oct.octY && mY() < oct.octY + oct.octBtnH) {
+        setMelodyOctave(slot, i);
+        return true;
+      }
+    }
+
+    // Hit test each pad position
+    for (let i = 0; i < 16; i++) {
+      const mp = MELODY_PAD_MAP[i];
+      if (mp.type === 'unused') continue;
+      const {x, y} = keyXY(i, L);
+      if (mX() > x && mX() < x+kw && mY() > y && mY() < y+kh) {
+        const noteIdx = slot.melodyOctave * 12 + mp.semitone;
+        const noteId = 'm' + noteIdx;
+        triggerMelodyNote(slot, noteId);
+        padFlash[noteId] = millis();
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Hit test each key (drum mode)
   for (let i = 0; i < slot.activePadIds.length; i++) {
     const id = slot.activePadIds[i];
     const {x, y} = keyXY(i, L);
@@ -534,13 +607,22 @@ function onControlPanelClick() {
   const trimX = L.panelX+1, trimY = L.panelY+1, trimW = L.panelW-2;
   if (isMappedEarly && hasCandidates && mY() > trimY && mY() < trimY+TRIM_H && mX() > trimX && mX() < trimX+trimW) {
     const dLeft = abs(mX()-trimX), dRight = abs(mX()-(trimX+trimW));
+    const ts = slot.drumTrimStart[def.id]||0, te = slot.drumTrimEnd[def.id]??1;
+    // Compute context duration for time-based minimum gap
+    const cand0 = cands[slot.drumIdx[def.id]||0];
+    const ctxDur = cand0 && cand0.buffer ? cand0.buffer.duration
+      : cand0 ? ((cand0.ctxEnd||1)-(cand0.ctxStart||0)) * (slot.sourceBuffer ? slot.sourceBuffer.duration : 1)
+      : 1;
     if (dLeft < 10 || dRight < 10) {
       const which = dRight <= dLeft ? 'trimEnd' : 'trimStart';
-      const ts = slot.drumTrimStart[def.id]||0, te = slot.drumTrimEnd[def.id]??1;
       drag = {type: which, id: def.id, slotIdx: selectedSlotIdx, barX: trimX, barW: trimW,
-              origStart: ts, origEnd: te, proposedStart: ts, proposedEnd: te};
+              origStart: ts, origEnd: te, proposedStart: ts, proposedEnd: te, startMouseX: mX(), ctxDuration: ctxDur};
       return true;
     }
+    // Click body (not near handles) — slide the whole trim window
+    drag = {type: 'trimSlide', id: def.id, slotIdx: selectedSlotIdx, barX: trimX, barW: trimW,
+            origStart: ts, origEnd: te, proposedStart: ts, proposedEnd: te, startMouseX: mX(), ctxDuration: ctxDur};
+    return true;
   }
 
   // Controls area
@@ -629,7 +711,11 @@ function onControlPanelClick() {
     if (hasTranscript && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
       slot.padMode[def.id] = 'lyrics';
       slot.padFinalized[def.id] = false;
-      if (slot.transcriptLoaded) openPicker(slot, def.id);
+      if (slot.transcriptLoaded) {
+        const btnX = (iconCurX + iconW / 2) * UI_SCALE;
+        const btnBottom = (iconCy + inputH / 2) * UI_SCALE;
+        openPicker(slot, def.id, btnX, btnBottom);
+      }
       return true;
     }
     iconCurX += iconW;
@@ -747,7 +833,7 @@ function mousePressed() {
   // Close step editor if clicking outside it
   if (_stepEditInput && _stepEditInput.style.display !== 'none' &&
       document.activeElement !== _stepEditInput) closeStepEdit();
-  if (pickerOpen) return;
+  if (pickerOpen) { closePicker(); return; }
   if (phase==='recording') {
     // Click anywhere stops the main recording (same as pressing R)
     stopRecording(); return;
@@ -792,32 +878,6 @@ function mousePressed() {
     return;
   }
   if (phase!=='ready') return;
-  // Cell pitch dropdown intercept — must be before other handlers
-  if (cellPitchDropdown) {
-    const d = cellPitchDropdown;
-    const itemH = 13, menuW = 22, totalItems = 25, zeroIdx = 12;
-    const totalH = totalItems * itemH;
-    const menuY = d.y + d.cellH / 2 - (zeroIdx + 0.5) * itemH;
-    const menuX = d.x + d.cellW / 2 - menuW / 2;
-    const clampedY = constrain(menuY, 2, cH() / UI_SCALE - totalH - 2);
-    const clampedX = constrain(menuX, 2, cW() / UI_SCALE - menuW - 2);
-    if (mX() > clampedX - 2 && mX() < clampedX + menuW + 2 && mY() > clampedY - 2 && mY() < clampedY + totalH + 2) {
-      const idx = Math.floor((mY() - clampedY) / itemH);
-      if (idx >= 0 && idx < totalItems) {
-        const val = 12 - idx;
-        const slot = slots[d.slotIdx];
-        if (slot) {
-          const ecp = editCellPitch(slot);
-          if (!ecp[d.padId]) ecp[d.padId] = new Array(slot.grid.steps).fill(0);
-          ecp[d.padId][d.stepIdx] = val;
-        }
-      }
-      cellPitchDropdown = null;
-      return;
-    }
-    cellPitchDropdown = null;
-    return;
-  }
   // Save/Load buttons in header
   if (mY()<HEADER_H) {
     const {saveBtnX, loadBtnX, btnY, btnW, btnH} = headerBtnRects();
@@ -841,6 +901,7 @@ function mouseDragged() {
       const gain = constrain((drag.graphY + drag.graphH/2 - mY()) / (drag.graphH/2) * EQ_GAIN_RANGE, -EQ_GAIN_RANGE, EQ_GAIN_RANGE);
       eq[drag.band] = Math.round(gain * 2) / 2; // snap to 0.5 dB
       slot.drumEQ[drag.padId] = eq;
+      updateLiveEQ(drag.slotIdx, drag.padId);
     }
     return;
   }
@@ -876,48 +937,43 @@ function mouseDragged() {
     const stepIdx=constrain(posToStep((mX()-drag.gridLeft)/drag.seqW,stepPositions),0,grid.steps-1);
     if (stepIdx===drag.lastS) return;
     const lo=min(stepIdx,drag.lastS),hi=max(stepIdx,drag.lastS);
-    const ec=editCells(slot); for (let i=lo;i<=hi;i++) { if (!ec[drag.drumId]) ec[drag.drumId]=new Array(grid.steps).fill(false); ec[drag.drumId][i]=drag.value; }
+    const ec=editCells(slot); for (let i=lo;i<=hi;i++) { if (!ec[drag.drumId]) ec[drag.drumId]=new Array(grid.steps).fill(false); ec[drag.drumId][i]=drag.value; if(!drag.value&&slot.type!=='melody'){const ecp=editCellPitch(slot);if(ecp[drag.drumId])ecp[drag.drumId][i]=0;} }
     drag.lastS=stepIdx; return;
   }
   if (drag.type==='dial') {
     const dy=drag.startY-mY();
     const slot=slots[drag.slotIdx||selectedSlotIdx];
-    if (drag.param==='vol') { slot.drumVolumes[drag.id]=constrain(drag.startVal+dy/80,0,1); }
-    else { slot.drumPitch[drag.id]=constrain(Math.round(drag.startVal+dy/8),-12,12); }
+    const si=drag.slotIdx||selectedSlotIdx;
+    if (drag.param==='vol') { slot.drumVolumes[drag.id]=constrain(drag.startVal+dy/80,0,1); updateLiveVolume(si, drag.id); }
+    else { slot.drumPitch[drag.id]=constrain(Math.round(drag.startVal+dy/8),-12,12); updateLivePitch(si, drag.id); }
   } else if (drag.type==='panelSlider') {
     const frac=constrain((mX()-drag.sldX)/drag.sldW,0,1);
     const slot=slots[drag.slotIdx||selectedSlotIdx];
-    if (drag.param==='vol') { slot.drumVolumes[drag.id]=frac; }
-    else if (drag.param==='pitch') { slot.drumPitch[drag.id]=Math.round(frac*24-12); }
+    const si=drag.slotIdx||selectedSlotIdx;
+    if (drag.param==='vol') { slot.drumVolumes[drag.id]=frac; updateLiveVolume(si, drag.id); }
+    else if (drag.param==='pitch') { slot.drumPitch[drag.id]=Math.round(frac*24-12); updateLivePitch(si, drag.id); }
     else if (drag.param==='speed') {
       if (drag.linked) {
-        // When linked, speed drag moves pitch in semitone steps
-        // frac 0→-12, 0.5→0, 1→+12 (log scale: frac maps to speed, speed maps to semitones)
         const semitones = Math.round(normToSpeed(frac) > 0 ? 12 * Math.log2(normToSpeed(frac)) : 0);
         slot.drumPitch[drag.id] = constrain(semitones, -12, 12);
+        updateLivePitch(si, drag.id);
       } else {
         slot.drumSpeed[drag.id]=normToSpeed(frac);
       }
     }
-  } else if (drag.type==='trimStart') {
-    // Accumulate displacement at current zoom level so handle tracks 1:1 with cursor
-    const prevMX = drag.lastMouseX ?? mX();
-    const dx = mX() - prevMX;
-    drag.lastMouseX = mX();
-    const curStart = drag.proposedStart ?? drag.origStart;
-    const curRange = (drag.proposedEnd ?? drag.origEnd) - curStart;
-    const delta = dx * (Math.max(curRange, 0.01) / drag.barW);
-    drag.proposedStart = constrain(curStart + delta, 0, drag.origEnd - 0.002);
-    drag.proposedEnd = drag.origEnd;
-  } else if (drag.type==='trimEnd') {
-    const prevMX = drag.lastMouseX ?? mX();
-    const dx = mX() - prevMX;
-    drag.lastMouseX = mX();
-    const curEnd = drag.proposedEnd ?? drag.origEnd;
-    const curRange = curEnd - (drag.proposedStart ?? drag.origStart);
-    const delta = dx * (Math.max(curRange, 0.01) / drag.barW);
-    drag.proposedStart = drag.origStart;
-    drag.proposedEnd = constrain(curEnd + delta, drag.origStart + 0.002, 1);
+  } else if (drag.type==='trimStart' || drag.type==='trimEnd') {
+    // Single linear mapping: bar is a viewport over [origStart, origEnd].
+    // Mouse position maps to fraction at a constant rate, same inside and outside the bar.
+    const r = computeTrimDrag(drag.type, mX(), drag.barX, drag.barW, drag.origStart, drag.origEnd, drag.ctxDuration||1);
+    drag.proposedStart = r.proposedStart;
+    drag.proposedEnd = r.proposedEnd;
+  } else if (drag.type==='trimSlide') {
+    const dx = mX() - drag.startMouseX;
+    const origRange = drag.origEnd - drag.origStart;
+    const delta = -dx / drag.barW * origRange;
+    const newStart = constrain(drag.origStart + delta, 0, 1 - origRange);
+    drag.proposedStart = newStart;
+    drag.proposedEnd = newStart + origRange;
   } else if (drag.type==='bpm') {
     seqBPM=constrain(map(mX(),drag.sliderX,drag.sliderX+drag.sliderW,40,240),40,240);
   } else if (drag.type==='seqVolH') {
@@ -934,7 +990,7 @@ function mouseDragged() {
     if (Math.abs(dx)>tw/2) {
       const nM=slot.grid.measures.length;
       const currentX=mX();
-      const baseX=slotHeaderLayout(SEQ_MARGIN+cW()-SEQ_MARGIN*2, nM).measureTabsX;
+      const baseX=slotHeaderLayout(SEQ_MARGIN+cW()-SEQ_MARGIN*2, nM, slot.type).measureTabsX;
       drag.targetIdx=constrain(Math.round((currentX-baseX)/tw), 0, nM);
     }
   } else if (drag.type==='reorderSlot') {
@@ -948,6 +1004,16 @@ function mouseDragged() {
     const dx=mX()-drag.startX, dy=mY()-drag.startY;
     if (Math.abs(dx)>5||Math.abs(dy)>5) drag.triggered=true;
     drag.currentX=mX(); drag.currentY=mY();
+  } else if (drag.type==='cellPitch') {
+    const dy = drag.startY - mY(); // up = positive pitch
+    const newPitch = constrain(drag.origPitch + Math.round(dy / 6), -12, 12);
+    drag.currentPitch = newPitch;
+    const slot = slots[drag.slotIdx];
+    if (slot) {
+      const ecp = editCellPitch(slot);
+      if (!ecp[drag.padId]) ecp[drag.padId] = new Array(slot.grid.steps).fill(0);
+      ecp[drag.padId][drag.stepIdx] = newPitch;
+    }
   }
 }
 
@@ -977,10 +1043,11 @@ function mouseReleased() {
     trimPlayStartTime=audioCtx.currentTime;
     trimPlayStartSec=trimState.trimStart;
   }
-  if (drag&&(drag.type==='trimStart'||drag.type==='trimEnd')) {
+  if (drag&&(drag.type==='trimStart'||drag.type==='trimEnd'||drag.type==='trimSlide')) {
     const slot=slots[drag.slotIdx||selectedSlotIdx];
     slot.drumTrimStart[drag.id]=drag.proposedStart??drag.origStart;
     slot.drumTrimEnd[drag.id]=drag.proposedEnd??drag.origEnd;
+    updateTrimLabel(slot, drag.id);
   }
   if (drag&&drag.type==='panelSlider'&&(drag.param==='pitch'||drag.param==='speed')) {
     invalidatePitchedCache(drag.slotIdx, drag.id);
@@ -1055,13 +1122,30 @@ function keyPressed() {
     if (panel) panel.style.display=_debugOpen?'block':'none';
     return;
   }
-  if (key==='Escape' && cellPitchDropdown) { cellPitchDropdown = null; return; }
-  if (key==='r'||key==='R') {
+  if ((key==='r'||key==='R') && !keyIsDown(SHIFT) && !(keyIsDown(91)||keyIsDown(93)||keyIsDown(17))) {
     if (phase==='recording') stopRecording(); else if (phase==='ready') startRecording(); return;
   }
   if (phase==='ready') {
+    const slot = currentSlot();
     const id=_kbdMap[key.toLowerCase()];
-    if (id) { selectPad(id); triggerDrum(id); padFlash[id]=millis(); padHeld[id]=true; if (seqRecording&&seqPlaying) quantizeToGrid0(id); }
+    if (id) {
+      if (slot.type === 'melody' && id.startsWith('m')) {
+        triggerMelodyNote(slot, id);
+        padFlash[id]=millis(); padHeld[id]=true;
+        if (seqRecording&&seqPlaying) {
+          // Record to grid
+          const { measureIdx } = slotLoopFraction(selectedSlotIdx);
+          const mCells = slot.grid.measures[measureIdx].cells;
+          if (!mCells[id]) mCells[id] = new Array(slot.grid.steps).fill(false);
+          const loopDur = loopDuration(), pos = (audioCtx.currentTime - _loopStartTime) % loopDur;
+          const step = Math.round((pos / loopDur) * slot.grid.steps) % slot.grid.steps;
+          mCells[id][step] = true;
+        }
+      } else {
+        selectPad(id); triggerDrum(id); padFlash[id]=millis(); padHeld[id]=true;
+        if (seqRecording&&seqPlaying) quantizeToGrid0(id);
+      }
+    }
     if (key===' ') { seqPlaying?stopSequencer():startSequencer(); }
     if (key==='u'||key==='U') uploadEl.elt.click();
   }
@@ -1069,7 +1153,8 @@ function keyPressed() {
 
 function keyReleased() {
   if (document.activeElement&&document.activeElement.classList.contains('pad-input')) return;
-  const id=_kbdMap[key.toLowerCase()]; if (id) padHeld[id]=false;
+  const id=_kbdMap[key.toLowerCase()];
+  if (id) padHeld[id]=false;
 }
 
 function doubleClicked() {
@@ -1085,10 +1170,10 @@ function doubleClicked() {
   if (!mapped) return;
   // Double-click on vol/pitch/speed slider area resets to default
   if (mX()>C.sliderX-4 && mX()<C.sliderX+C.sliderW+4) {
-    if (abs(mY()-C.volSliderY)<10) { slot.drumVolumes[def.id]=0.8; return; }
-    if (abs(mY()-C.pitchSliderY)<10) { slot.drumPitch[def.id]=0; invalidatePitchedCache(selectedSlotIdx, def.id); return; }
+    if (abs(mY()-C.volSliderY)<10) { slot.drumVolumes[def.id]=0.8; updateLiveVolume(selectedSlotIdx, def.id); return; }
+    if (abs(mY()-C.pitchSliderY)<10) { slot.drumPitch[def.id]=0; updateLivePitch(selectedSlotIdx, def.id); invalidatePitchedCache(selectedSlotIdx, def.id); return; }
     if (abs(mY()-C.speedSliderY)<10) {
-      if (slot.drumPitchSpeedLinked[def.id]??true) { slot.drumPitch[def.id]=0; }
+      if (slot.drumPitchSpeedLinked[def.id]??true) { slot.drumPitch[def.id]=0; updateLivePitch(selectedSlotIdx, def.id); }
       else { slot.drumSpeed[def.id]=1.0; }
       invalidatePitchedCache(selectedSlotIdx, def.id); return;
     }
@@ -1096,18 +1181,22 @@ function doubleClicked() {
   // Double-click on inline EQ graph resets EQ to flat
   if (mX()>C.eqGraphX && mX()<C.eqGraphX+C.eqGraphW && mY()>C.eqGraphY && mY()<C.eqGraphY+C.eqGraphH) {
     slot.drumEQ[def.id] = { low: 0, mid: 0, high: 0 };
+    updateLiveEQ(selectedSlotIdx, def.id);
     return;
   }
 }
 
 // ── Transcript picker ────────────────────────────────────────────────────────
 
-function openPicker(slot, padId) {
+function openPicker(slot, padId, anchorX, anchorY) {
   pickerOpen=true; pickerSlot=slot; pickerPadId=padId;
   pickerSel=[]; pickerAnchor=null;
-  const L=getPadAreaLayout();
-  pickerEl.style.left=Math.min(L.panelX*UI_SCALE,windowWidth-430)+'px';
-  pickerEl.style.top=((L.panelY+L.panelH+4)*UI_SCALE)+'px';
+  // Position below the transcript button, clamped to viewport
+  const pw = 420; // max-width of picker
+  const left = Math.max(0, Math.min((anchorX || 0) - pw / 2, windowWidth - pw));
+  const top = (anchorY || 0) + 4;
+  pickerEl.style.left = left + 'px';
+  pickerEl.style.top = top + 'px';
   pickerEl.style.display='block'; renderPickerChips();
 }
 

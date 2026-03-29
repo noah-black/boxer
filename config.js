@@ -20,11 +20,34 @@ function getPadDef(id) { return PAD_DEFS.find(d => d.id === id); }
 
 let availablePrototypes = [];
 
+// ── Melody (piano roll) constants ───────────────────────────────────────────
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const MELODY_OCTAVE_COUNT = 4;
+const MELODY_TOTAL_NOTES = 49;  // 4 octaves * 12 + 1 top C
+const MELODY_CENTER = 24;       // index of unshifted note (0 semitones)
+
+const MELODY_KBD = [
+  { key: 'z', semitone: 0  },  // C
+  { key: 's', semitone: 1  },  // C#
+  { key: 'x', semitone: 2  },  // D
+  { key: 'd', semitone: 3  },  // D#
+  { key: 'c', semitone: 4  },  // E
+  { key: 'v', semitone: 5  },  // F
+  { key: 'g', semitone: 6  },  // F#
+  { key: 'b', semitone: 7  },  // G
+  { key: 'h', semitone: 8  },  // G#
+  { key: 'n', semitone: 9  },  // A
+  { key: 'j', semitone: 10 },  // A#
+  { key: 'm', semitone: 11 },  // B
+  { key: ',', semitone: 12 },  // C (next octave)
+];
+const MELODY_UNUSED_KEYS = ['a', 'f', 'k'];
+
 
 // ── Palette (HSB: hue/360, sat/100, brightness/100) ─────────────────────────
 // Editable via debug overlay (backtick key to toggle)
 let _palette = {
-  BG:           [191, 20, 100],
+  BG:           [43,  5, 79],
   PANEL:        [201, 10, 91],
   CTRL_PANEL:   [210, 16, 100],
   SEQ_CELL:     [201,  9, 98],
@@ -38,7 +61,7 @@ let _palette = {
   DRUM_S_LITE: 35, DRUM_B_LITE: 90,
 };
 // Live references — these arrays/values are updated in place by the debug overlay
-const BG        = [191, 20, 100];
+const BG        = [43,  5, 79];
 const PANEL     = [201, 10, 91];
 const CTRL_PANEL = [210, 16, 100];
 const SEQ_CELL  = [201,  9, 98];
@@ -48,6 +71,7 @@ const INK_DIM   = [210,  5,  0];
 const INK_FAINT = [210,  3,  0];
 const ACCENT    = [205, 45, 75];
 const RED       = [0,  55,  65];
+const MELODY_CELL = [210, 25, 70];
 const SELECTED_HDR = [206,  8, 100];
 let DRUM_S = 75, DRUM_B = 53;
 let DRUM_S_LITE = 35, DRUM_B_LITE = 90;
@@ -149,12 +173,15 @@ function truncateMiddle(str, maxWidth) {
   return str.slice(0,2).trimEnd()+'\u2026';
 }
 
-/** Create a new slot data structure. Starts with no active pads. */
+/** Create a new slot data structure. Starts with no active pads.
+ *  @param {string} type - 'drum' (default) or 'melody' */
 let _nextHueOffset = 0;
-function createSlot() {
+function createSlot(type) {
+  type = type || 'drum';
   const offset = _nextHueOffset;
   _nextHueOffset = (_nextHueOffset + 137) % 360; // golden-angle step for variety
-  return {
+  const slot = {
+    type: type,
     drumCandidates: {}, drumIdx: {}, drumVolumes: {}, drumPitch: {},
     drumTrimStart: {}, drumTrimEnd: {}, drumEQ: {},
     drumSpeed: {}, drumPitchSpeedLinked: {},
@@ -167,4 +194,9 @@ function createSlot() {
     hueOffset: offset,
     fileName: null,
   };
+  if (type === 'melody') {
+    slot.melodyOctave = 2;            // base octave (unshifted)
+    slot.melodySoundPadId = 'pad_0';  // single pad holding the sound source
+  }
+  return slot;
 }

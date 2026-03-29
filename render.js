@@ -14,7 +14,7 @@ function drawBgGradient() {
 /** Compute keyboard grid + control panel layout.
  *  Panel on left ~1/3, keys on right ~2/3 of content area. */
 function getPadAreaLayout() {
-  const PAD_AREA_TOP = HEADER_H + 42; // 20px enclosure padding + 20px clearance from header
+  const PAD_AREA_TOP = HEADER_H + 16; // 8px enclosure padding + 8px clearance from header
 
   // Sequencer width defines the reference area
   const seqLeft = SEQ_MARGIN;
@@ -67,19 +67,28 @@ function keyXY(padIndex, layout) {
   };
 }
 
+function slotRowHeight(slot, seqRowHeight) {
+  return slot.type === 'melody' ? Math.max(SEQ_ROW_H_MIN, Math.round(seqRowHeight * MELODY_ROW_SCALE)) : seqRowHeight;
+}
+
 function totalSeqContentHeight(seqRowHeight) {
   let h = 0;
-  slots.forEach(slot => { h += SLOT_HDR_H + getSeqPads(slot).length * seqRowHeight + SLOT_GAP; });
+  slots.forEach(slot => { h += SLOT_HDR_H + getSeqPads(slot).length * slotRowHeight(slot, seqRowHeight) + SLOT_GAP; });
   return h + 96;
 }
 
+const MELODY_ROW_SCALE = 0.67; // melody rows are ~2/3 height of drum rows
+
 function getSeqLayout() {
   const L = getPadAreaLayout();
-  const seqTop  = L.gridY + L.gridH + 42; // 20px enclosure padding + 20px clearance below
+  const seqTop  = L.gridY + L.gridH + 16; // 8px enclosure padding + 8px clearance below
   const seqW    = cW()-SEQ_MARGIN*2-SEQ_LABEL_W;
   const gridTop = seqTop+SEQ_CTRL_H;
   const available = cH()-gridTop-96; // reserve space for add-slot "+" below last slot
-  const totalGridRows = slots.reduce((acc,slot) => acc+getSeqPads(slot).length, 0);
+  // Weight melody rows at MELODY_ROW_SCALE to compute equivalent row count
+  const drumRows = slots.reduce((acc,s) => acc + (s.type !== 'melody' ? getSeqPads(s).length : 0), 0);
+  const melodyRows = slots.reduce((acc,s) => acc + (s.type === 'melody' ? getSeqPads(s).length : 0), 0);
+  const totalGridRows = drumRows + melodyRows * MELODY_ROW_SCALE;
   const N = slots.length;
   const SLOT_HDR_MIN = 22;
   // First compute row height assuming header = row height
@@ -96,7 +105,7 @@ function getSlotGridTop(slotIndex, gridTop, seqRowHeight) {
   let y = gridTop;
   for (let i = 0; i < slotIndex; i++) {
     const slot = slots[i], numRows = getSeqPads(slot).length;
-    y += SLOT_HDR_H + numRows*seqRowHeight + SLOT_GAP;
+    y += SLOT_HDR_H + numRows*slotRowHeight(slot, seqRowHeight) + SLOT_GAP;
   }
   return y + SLOT_HDR_H;
 }
@@ -108,7 +117,7 @@ function getSlotHeaderY(slotIndex, gridTop, seqRowHeight) {
 
 
 /** Compute slot header control positions. Sliders compress by up to 20% when space is tight. */
-function slotHeaderLayout(headerRight, nMeasures) {
+function slotHeaderLayout(headerRight, nMeasures, slotType) {
   nMeasures = nMeasures || 1;
   const btnH=14;
   const capsuleCellW=btnH, capsuleCells=2, capsuleW=capsuleCellW*capsuleCells;
@@ -124,9 +133,9 @@ function slotHeaderLayout(headerRight, nMeasures) {
   const stepW=36, stepH=12;
   const stepX=clrX-8-stepW;
 
-  // Measure tabs: right after hamburger
+  // Measure tabs: right after hamburger (+ type icon for melody)
   const measureTabW=12, measurePlusW=12;
-  const measureTabsX=SEQ_MARGIN+22;
+  const measureTabsX=SEQ_MARGIN + (slotType === 'melody' ? 30 : 22);
   const measureTabsW=nMeasures*measureTabW+(nMeasures<MAX_MEASURES?measurePlusW:0);
 
   // Left edge of slider zone: after measure tabs + filename area (min space for filename)
@@ -165,7 +174,7 @@ function slotHeaderLayout(headerRight, nMeasures) {
 function positionSharedInput() {
   if (!_sharedInputEl) return;
   const slot = currentSlot();
-  const show = (phase==='ready'||phase==='recording') && slotHasAudio(slot) && !slot.analyzing && !slot.reuploadPending && selectedPadId;
+  const show = (phase==='ready'||phase==='recording') && slotHasAudio(slot) && !slot.analyzing && !slot.reuploadPending && selectedPadId && slot.type !== 'melody';
   if (!show) { _sharedInputEl.style.display='none'; return; }
   const L = getPadAreaLayout();
   const finalized = !!slot.padFinalized[selectedPadId];
@@ -209,7 +218,7 @@ function updateElementVisibility() {
 
 function draw() {
   if (!_fontsReady) { drawBgGradient(); return; }
-  cursor(ARROW);
+  cursor(drag && drag.type==='trimSlide' ? 'grabbing' : ARROW);
   SEQ_MARGIN = min(SEQ_MARGIN_MAX, max(8, (cW() - CONTENT_MIN_W) / 2));
   drawBgGradient();
   push(); scale(UI_SCALE);
@@ -386,23 +395,143 @@ function drawPadAreaEnclosure() {
   if ((!slotHasAudio(slot) || slot.reuploadPending) && !slot.analyzing) return;
   if (slot.analyzing) return;
   // Enclosing rounded rectangle spanning panel + keyboard
-  const pad = 20;
+  const pad = 8;
   const left = Math.min(L.panelX, L.gridX) - pad;
   const right = Math.max(L.panelX + L.panelW, L.gridX + L.gridW) + pad;
   const top = L.gridY - pad;
   const bot = L.gridY + L.gridH + pad;
   fill(...PANEL);
   stroke(...INK); strokeWeight(1);
-  rect(left, top, right - left, bot - top, CORNER_RADIUS * 2);
+  rect(left, top, right - left, bot - top, CORNER_RADIUS);
+}
+
+// ── Melody keyboard (reuses 2×8 pad grid with piano coloring) ───────────────
+
+// Maps pad grid position (0-15) to melody key role.
+// Row 0 (home row): A S D F G H J K → positions 0-7
+// Row 1 (bottom):   Z X C V B N M , → positions 8-15
+const MELODY_PAD_MAP = [
+  // Home row: A(unused) S(C#) D(D#) F(unused) G(F#) H(G#) J(A#) K(unused)
+  { type: 'unused', key: 'A' },
+  { type: 'black',  key: 'S', semitone: 1 },
+  { type: 'black',  key: 'D', semitone: 3 },
+  { type: 'unused', key: 'F' },
+  { type: 'black',  key: 'G', semitone: 6 },
+  { type: 'black',  key: 'H', semitone: 8 },
+  { type: 'black',  key: 'J', semitone: 10 },
+  { type: 'unused', key: 'K' },
+  // Bottom row: Z(C) X(D) C(E) V(F) B(G) N(A) M(B) ,(C+)
+  { type: 'white', key: 'Z', semitone: 0 },
+  { type: 'white', key: 'X', semitone: 2 },
+  { type: 'white', key: 'C', semitone: 4 },
+  { type: 'white', key: 'V', semitone: 5 },
+  { type: 'white', key: 'B', semitone: 7 },
+  { type: 'white', key: 'N', semitone: 9 },
+  { type: 'white', key: 'M', semitone: 11 },
+  { type: 'white', key: ',', semitone: 12 },
+];
+
+function drawMelodyKeyboard(L, slot) {
+  // Auto-select the single sound pad
+  if (selectedPadId !== slot.melodySoundPadId) {
+    selectedPadId = slot.melodySoundPadId;
+    syncSharedInput(); positionSharedInput();
+  }
+
+  const kw = L.kw || KEY_W, kh = L.kh || KEY_H;
+  const ho = slot.hueOffset || 0;
+
+  // Draw each pad position using existing grid layout
+  for (let i = 0; i < 16; i++) {
+    const mp = MELODY_PAD_MAP[i];
+    const {x, y} = keyXY(i, L);
+    const hov = mX()>x && mX()<x+kw && mY()>y && mY()<y+kh;
+
+    let noteId = null, flash = 9999, held = false;
+    if (mp.type !== 'unused') {
+      const noteIdx = slot.melodyOctave * 12 + mp.semitone;
+      noteId = 'm' + noteIdx;
+      flash = padFlash[noteId] ? (millis() - padFlash[noteId]) : 9999;
+      held = padHeld[noteId];
+    }
+
+    push();
+    if (mp.type === 'unused') {
+      // Grayed out, non-interactive
+      fill(...BG, 40);
+      stroke(...INK_FAINT, 30); strokeWeight(0.5);
+    } else if (mp.type === 'black') {
+      if (held || flash < 120) fill(210, 30, 60);
+      else if (hov) fill(210, 8, 30);
+      else fill(210, 8, 20);
+      stroke(...INK_FAINT); strokeWeight(0.5);
+    } else {
+      // white
+      if (held || flash < 120) fill(210, 20, 95);
+      else if (hov) fill(0, 0, 98);
+      else fill(0, 0, 100);
+      stroke(...INK_FAINT); strokeWeight(0.5);
+    }
+    rect(x, y, kw, kh, 4);
+
+    // Key letter only
+    noStroke();
+    if (mp.type === 'unused') fill(...INK_FAINT, 30);
+    else if (mp.type === 'black') fill(0, 0, 55);
+    else fill(...INK_DIM);
+    textSize(12); textAlign(CENTER, CENTER);
+    text(mp.key, x+kw/2, y+kh/2);
+    pop();
+    if (hov && mp.type !== 'unused') cursor(HAND);
+  }
+
+  // Octave selector: 4 small buttons below bottom-row keys, within pad area height
+  const octBtnW = 20, octBtnH = 11, octGap = 3;
+  const octLabels = ['-2', '-1', '0', '+1'];
+  const totalOctW = octLabels.length * octBtnW + (octLabels.length - 1) * octGap;
+  // Position below the bottom key row, right-aligned within grid
+  const botRowY = (L.keysOffsetY || 0) + KEY_GAP + (kh + KEY_GAP);
+  const octY = L.gridY + botRowY + kh + 3;
+  const octX = L.gridX + KEY_ROW2_OFFSET + 8*(kw+KEY_GAP) - KEY_GAP - totalOctW;
+
+  push();
+  textAlign(CENTER, CENTER); textSize(6);
+  octLabels.forEach((lbl, i) => {
+    const bx = octX + i * (octBtnW + octGap);
+    const isActive = i === slot.melodyOctave;
+    const bHov = mX()>bx && mX()<bx+octBtnW && mY()>octY && mY()<octY+octBtnH;
+    if (isActive) {
+      fill(...ACCENT); stroke(...ACCENT); strokeWeight(0.5);
+    } else {
+      fill(bHov ? [0, 0, 90] : [0, 0, 93]); stroke(...INK_FAINT); strokeWeight(0.5);
+    }
+    rect(bx, octY, octBtnW, octBtnH, 3);
+    fill(isActive ? 360 : INK[0], isActive ? 0 : INK[1], isActive ? 100 : INK[2]);
+    noStroke();
+    text(lbl, bx + octBtnW/2, octY + octBtnH/2);
+    if (bHov) cursor(HAND);
+  });
+  pop();
+}
+
+function getMelodyOctaveLayout(L) {
+  const kw = L.kw || KEY_W, kh = L.kh || KEY_H;
+  const octBtnW = 20, octBtnH = 11, octGap = 3;
+  const totalOctW = 4 * octBtnW + 3 * octGap;
+  const botRowY = (L.keysOffsetY || 0) + KEY_GAP + (kh + KEY_GAP);
+  const octY = L.gridY + botRowY + kh + 3;
+  const octX = L.gridX + KEY_ROW2_OFFSET + 8*(kw+KEY_GAP) - KEY_GAP - totalOctW;
+  return { octX, octY, octBtnW, octBtnH, octGap };
 }
 
 function drawKeyGrid() {
   const L = getPadAreaLayout();
   const slot = currentSlot();
 
-
   if ((!slotHasAudio(slot) || slot.reuploadPending) && !slot.analyzing) { drawEmptySlotPrompt(); return; }
   if (slot.analyzing) { drawAnalyzingAnimation(); return; }
+
+  if (slot.type === 'melody') { drawMelodyKeyboard(L, slot); return; }
 
   // Auto-select first pad if none selected
   if (!selectedPadId || !slot.activePadIds.includes(selectedPadId)) {
@@ -525,7 +654,12 @@ function drawControlPanel() {
   const speedVal = linked ? Math.pow(2, (slot.drumPitch[def.id]??0)/12) : (slot.drumSpeed[def.id]??1.0);
   drawPanelSlider(odef, C.sliderX, C.speedSliderY, C.sliderW, 'speed', speedVal, 0.5, 2.0, hasCandidates, !isMapped);
 
-  // Text input area + mode icons — first row spans full panel width
+  // Text input area + mode icons — first row spans full panel width (drum only)
+  if (slot.type === 'melody') {
+    // Inline EQ graph — always shown for melody
+    drawInlineEQ(odef, C, slot, def.id, !isMapped);
+    return;
+  }
   const finalized = !!slot.padFinalized[def.id];
   const inputY = C.ctrlY;
   const inputH = C.inputRowH - 4;
@@ -1000,7 +1134,7 @@ function drawPanelTrimBar(drum, x, y, w, slot) {
   const hasCandidates = slot.drumCandidates[drum.id] && slot.drumCandidates[drum.id].length>0;
   const curCand = hasCandidates ? slot.drumCandidates[drum.id][slot.drumIdx[drum.id]] : null;
   fill(BG[0], 6, 100); stroke(drum.hue, 12, 82); strokeWeight(0.5);
-  rect(x, y, w, h, CORNER_RADIUS, CORNER_RADIUS, 0, 0);
+  rect(x, y, w, h);
   if (!hasCandidates || !curCand) return;
 
   let channel;
@@ -1014,16 +1148,25 @@ function drawPanelTrimBar(drum, x, y, w, slot) {
   if (!channel) return;
 
   const ts = slot.drumTrimStart[drum.id]||0, te = slot.drumTrimEnd[drum.id]??1;
-  const activeDrag = drag && (drag.type==='trimStart'||drag.type==='trimEnd') && drag.id===drum.id;
+  const activeDrag = drag && (drag.type==='trimStart'||drag.type==='trimEnd'||drag.type==='trimSlide') && drag.id===drum.id;
   let dispStart = ts, dispEnd = te, shrinkHandleFrac = null;
 
   if (activeDrag) {
     const ps = drag.proposedStart??ts, pe = drag.proposedEnd??te;
-    const extending = (drag.type==='trimStart') ? (ps<ts) : (pe>te);
-    if (extending) { dispStart=ps; dispEnd=pe; }
+    if (drag.type==='trimSlide') { dispStart=ps; dispEnd=pe; }
     else {
-      if (drag.type==='trimStart') shrinkHandleFrac=(ps-ts)/(te-ts);
-      else shrinkHandleFrac=(pe-ts)/(te-ts);
+      const extending = (drag.type==='trimStart') ? (ps < ts) : (pe > te);
+      if (extending) {
+        // Zoom out to show the extended range
+        dispStart = ps; dispEnd = pe;
+      } else {
+        // Frozen viewport with floating handle
+        const range = te - ts;
+        if (range > 0.001) {
+          if (drag.type==='trimStart') shrinkHandleFrac = constrain((ps - ts) / range, 0, 1);
+          else shrinkHandleFrac = constrain((pe - ts) / range, 0, 1);
+        }
+      }
     }
   }
 
@@ -1063,6 +1206,7 @@ function drawPanelTrimBar(drum, x, y, w, slot) {
   fill(drum.hue, nearLeft?80:DRUM_S, nearLeft?65:DRUM_B); noStroke(); rect(x, y, 3, h, 1);
   fill(drum.hue, nearRight?80:DRUM_S, nearRight?65:DRUM_B); rect(x+w-3, y, 3, h, 1);
   if (nearLeft||nearRight) cursor(HAND);
+  else if (overTrimBar && !activeDrag && !nearLeft && !nearRight) cursor('grab');
 }
 
 
@@ -1387,7 +1531,7 @@ function drawSlotHeader(slot, slotIndex, slotGridTopY, seqRowHeight, numSeqRows)
   const isLast=slotIndex===slots.length-1;
 
   const headerRight=SEQ_MARGIN+headerW;
-  const L=slotHeaderLayout(headerRight, slot.grid.measures.length);
+  const L=slotHeaderLayout(headerRight, slot.grid.measures.length, slot.type);
   const btnY=headerY+(SLOT_HDR_H-L.btnH)/2;
 
   const volFrac=slot.gridVolume??1.0, volHandleX=L.volSliderX+volFrac*L.volSliderW;
@@ -1403,6 +1547,14 @@ function drawSlotHeader(slot, slotIndex, slotGridTopY, seqRowHeight, numSeqRows)
 
   fill(...INK); noStroke(); textSize(7); textAlign(LEFT,CENTER);
   text('\u2630', SEQ_MARGIN+7, headerMid);
+
+  // Type indicator next to hamburger (melody only)
+  if (slot.type === 'melody') {
+    push(); noStroke(); fill(...INK_FAINT);
+    const tiX = SEQ_MARGIN + 19, tiY = headerMid - 3;
+    for (let r = 0; r < 3; r++) rect(tiX, tiY + r * 2.5, 5, 1, 0.5);
+    pop();
+  }
 
   // ── Measure tabs ──────────────────────────────────────────────────────────
   drawMeasureTabs(slot, slotIndex, L, headerMid);
@@ -1465,10 +1617,11 @@ function drawSlotHeader(slot, slotIndex, slotGridTopY, seqRowHeight, numSeqRows)
 
 /** Draw the step grid for a single slot (cells, column bands, scanline). */
 function drawSlotGrid(slot, slotIndex, slotGridTopY, seqRowHeight, seqW, gridLeft, loopProgress, isLast) {
+  const rowH = slotRowHeight(slot, seqRowHeight);
   const seqDrums=getSeqPads(slot), numSeqRows=seqDrums.length;
   if (numSeqRows === 0) return;
 
-  const grid=slot.grid, gridHeight=numSeqRows*seqRowHeight;
+  const grid=slot.grid, gridHeight=numSeqRows*rowH;
   const stepPositions=computeStepPositions(grid,slot);
   const scanX=gridLeft+loopProgress*seqW;
   const ho=slot.hueOffset||0;
@@ -1483,25 +1636,63 @@ function drawSlotGrid(slot, slotIndex, slotGridTopY, seqRowHeight, seqW, gridLef
     rect(x0,slotGridTopY+1,x1-x0-1,gridHeight-2);
   }
 
+  const isMelody = slot.type === 'melody';
+
   seqDrums.forEach((drum,rowIndex) => {
-    const rowY=slotGridTopY+rowIndex*seqRowHeight;
+    const rowY=slotGridTopY+rowIndex*rowH;
     if (rowIndex>0) { stroke(0,0,58); strokeWeight(1); line(gridLeft,rowY,gridLeft+seqW,rowY); }
+
+    // Black-key row tinting for melody
+    if (isMelody && drum.isBlack) {
+      noStroke(); fill(210, 6, 88, 60);
+      rect(gridLeft, rowY, seqW, rowH);
+    }
 
     const labelX=SEQ_MARGIN, labelW=SEQ_LABEL_W;
     const effMouseYL=mY()+seqScrollY;
-    const labelHov=mX()>labelX&&mX()<labelX+labelW&&effMouseYL>rowY&&effMouseYL<rowY+seqRowHeight;
-    const hasCand=slot.drumCandidates[drum.id]&&slot.drumCandidates[drum.id].length>0;
-    fill(labelHov?[dHue(drum.hue),DRUM_S,DRUM_B]:(hasCand?[dHue(drum.hue),DRUM_S,DRUM_B]:INK_FAINT));
-    if (labelHov) { fill(dHue(drum.hue),DRUM_S+10,DRUM_B+5); cursor(HAND); }
-    noStroke(); textSize(7); textAlign(RIGHT,CENTER);
-    const textValue=(slot.padText[drum.id]||'').trim();
-    let rowLabel=textValue||padDisplayKey(drum.id);
-    const maxLabelW=SEQ_LABEL_W-20;
-    if (textWidth(rowLabel)>maxLabelW) {
-      while (rowLabel.length>1&&textWidth(rowLabel.trim()+'\u2026')>maxLabelW) rowLabel=rowLabel.slice(0,-1);
-      rowLabel=rowLabel.trim()+'\u2026';
+    const labelHov=mX()>labelX&&mX()<labelX+labelW&&effMouseYL>rowY&&effMouseYL<rowY+rowH;
+
+    if (isMelody) {
+      // Piano-key shaped label: white keys are wider, black keys narrower+dark
+      const isBlack = drum.isBlack;
+      const keyLabelW = isBlack ? SEQ_LABEL_W * 0.6 : SEQ_LABEL_W - 2;
+      const keyLabelX = gridLeft - keyLabelW - 2;
+      const keyLabelY = rowY + 0.5;
+      const keyLabelH = rowH - 1;
+
+      if (isBlack) {
+        fill(labelHov ? [210, 15, 35] : [210, 8, 20]);
+      } else {
+        fill(labelHov ? [0, 0, 98] : [0, 0, 100]);
+      }
+      stroke(...INK_FAINT, 50); strokeWeight(0.5);
+      rect(keyLabelX, keyLabelY, keyLabelW, keyLabelH, 1, 1, 0, 0);
+
+      // Octave indicator: show on the bottom C row (semitone offset 0 within octave)
+      const noteInOctave = (parseInt(drum.id.slice(1)) % 12);
+      if (noteInOctave === 0) {
+        const octIdx = Math.floor(parseInt(drum.id.slice(1)) / 12);
+        const octLabel = octIdx === 2 ? '' : octIdx < 2 ? (octIdx - 2) + '' : '+' + (octIdx - 2);
+        if (octLabel) {
+          fill(...INK_FAINT); noStroke(); textSize(5); textAlign(LEFT, CENTER);
+          text(octLabel, keyLabelX + 2, keyLabelY + keyLabelH/2);
+        }
+      }
+      if (labelHov) cursor(HAND);
+    } else {
+      const hasCand=slot.drumCandidates[drum.id]&&slot.drumCandidates[drum.id].length>0;
+      fill(labelHov?[dHue(drum.hue),DRUM_S,DRUM_B]:(hasCand?[dHue(drum.hue),DRUM_S,DRUM_B]:INK_FAINT));
+      if (labelHov) { fill(dHue(drum.hue),DRUM_S+10,DRUM_B+5); cursor(HAND); }
+      noStroke(); textSize(7); textAlign(RIGHT,CENTER);
+      const textValue=(slot.padText[drum.id]||'').trim();
+      let rowLabel=textValue||padDisplayKey(drum.id);
+      const maxLabelW=SEQ_LABEL_W-20;
+      if (textWidth(rowLabel)>maxLabelW) {
+        while (rowLabel.length>1&&textWidth(rowLabel.trim()+'\u2026')>maxLabelW) rowLabel=rowLabel.slice(0,-1);
+        rowLabel=rowLabel.trim()+'\u2026';
+      }
+      text(rowLabel,gridLeft-8,rowY+rowH/2);
     }
-    text(rowLabel,gridLeft-8,rowY+seqRowHeight/2);
 
     const ec=grid.measures[grid.editMeasure].cells;
     const ecp=(grid.measures[grid.editMeasure].cellPitch)||{};
@@ -1511,37 +1702,68 @@ function drawSlotGrid(slot, slotIndex, slotGridTopY, seqRowHeight, seqW, gridLef
       const on=ec[drum.id]?ec[drum.id][step]:false;
       const isHead=seqPlaying&&loopProgress>=stepPositions[step]&&loopProgress<stepPositions[step+1];
       const effMouseY=mY()+seqScrollY;
-      const cellHov=mX()>x0+1&&mX()<x0+cellW-1&&effMouseY>rowY+1&&effMouseY<rowY+seqRowHeight-1;
+      const cellHov=mX()>x0+1&&mX()<x0+cellW-1&&effMouseY>rowY+1&&effMouseY<rowY+rowH-1;
       const pad2=1.5;
-      const cp=on&&ecp[drum.id]?(ecp[drum.id][step]||0):0;
-      if      (isHead&&on) fill(dHue(drum.hue),DRUM_S+8,DRUM_B+10);
-      else if (isHead)     fill(dHue(drum.hue),DRUM_S_LITE,DRUM_B_LITE-10);
-      else if (on)         fill(dHue(drum.hue),DRUM_S,DRUM_B,cellHov?100:90);
-      else if (cellHov)    fill(dHue(drum.hue),20,85,50);
-      else                 noFill();
-      noStroke();
-      if (on||isHead||cellHov) rect(x0+pad2,rowY+pad2,cellW-pad2*2,seqRowHeight-pad2*2,2);
-      // Per-cell pitch indicator
-      if (on && cellW >= 14) {
-        if (cp !== 0) {
-          // Show pitch value always when set
-          fill(0,0,100,80); noStroke();
-          textSize(min(6, seqRowHeight * 0.45)); textAlign(RIGHT, CENTER);
-          text((cp>0?'+':'')+cp, x0+cellW-3, rowY+seqRowHeight/2);
-        } else if (cellHov && !pickerOpen) {
-          // Show faint quarter note on hover
-          fill(0,0,100,35); noStroke();
-          textSize(min(8, seqRowHeight * 0.55)); textAlign(RIGHT, CENTER);
-          text('\u2669', x0+cellW-3, rowY+seqRowHeight/2);
+      // Compute glow fraction from cell trigger
+      let glow = 0;
+      if (on) {
+        const glowKey = slotIndex + '_' + drum.id + '_' + step;
+        const g = _cellGlow[glowKey];
+        if (g) {
+          const elapsed = millis() - g.triggerMs;
+          if (elapsed >= 0 && elapsed < g.durationMs) glow = 1 - elapsed / g.durationMs;
         }
-      } else if (on && cp !== 0 && cellW >= 6) {
-        // Narrow cell: small dot indicator for non-zero pitch
-        fill(0,0,100,60); noStroke();
-        circle(x0+cellW-3, rowY+3, 2);
+      }
+      const glowS = glow * 20, glowB = glow * 30;
+
+      if (isMelody) {
+        // Uniform bluish cells for melody
+        const mH = MELODY_CELL[0], mS = MELODY_CELL[1], mB = MELODY_CELL[2];
+        if      (isHead&&on) fill(mH, mS+8+glowS, min(100, mB+10+glowB));
+        else if (isHead)     fill(mH, mS-10, mB+30);
+        else if (on)         fill(mH, mS+glowS, min(100, mB+glowB), cellHov?100:90);
+        else if (cellHov)    fill(mH, 15, 85, 50);
+        else                 noFill();
+      } else {
+        const cp=on&&ecp[drum.id]?(ecp[drum.id][step]||0):0;
+        if      (isHead&&on) fill(dHue(drum.hue),DRUM_S+8+glowS,min(100,DRUM_B+10+glowB));
+        else if (isHead)     fill(dHue(drum.hue),DRUM_S_LITE,DRUM_B_LITE-10);
+        else if (on)         fill(dHue(drum.hue),DRUM_S+glowS,min(100,DRUM_B+glowB),cellHov?100:90);
+        else if (cellHov)    fill(dHue(drum.hue),20,85,50);
+        else                 noFill();
+      }
+      noStroke();
+      if (on||isHead||cellHov) rect(x0+pad2,rowY+pad2,cellW-pad2*2,rowH-pad2*2,2);
+
+      // Per-cell pitch indicator (drum only)
+      if (!isMelody) {
+        const cp=on&&ecp[drum.id]?(ecp[drum.id][step]||0):0;
+        if (on && cellW >= 14) {
+          if (cp !== 0) {
+            fill(0,0,100,80); noStroke();
+            const pitchStr = (cp>0?'+':'')+cp;
+            const noteSize = min(8, rowH * 0.55);
+            const numSize = min(6, rowH * 0.45);
+            textSize(numSize); const numW = textWidth(pitchStr);
+            textSize(noteSize); const noteW = textWidth('\u2669');
+            const rx = x0 + cellW - 3;
+            textAlign(RIGHT, CENTER);
+            textSize(numSize); text(pitchStr, rx, rowY+rowH/2);
+            textSize(noteSize); text('\u2669', rx - numW - 1, rowY+rowH/2);
+          } else if (cellHov && !pickerOpen) {
+            fill(0,0,100,35); noStroke();
+            textSize(min(8, rowH * 0.55)); textAlign(RIGHT, CENTER);
+            text('\u2669', x0+cellW-3, rowY+rowH/2);
+          }
+        } else if (on && cp !== 0 && cellW >= 6) {
+          fill(0,0,100,60); noStroke();
+          circle(x0+cellW-3, rowY+3, 2);
+        }
       }
       if (!on&&!isHead) {
         const isBeat=step%4===0;
-        fill(dHue(drum.hue),28,isBeat?60:80,75); noStroke(); circle(x0+cellW/2,rowY+seqRowHeight/2,isBeat?3:1.8);
+        const dotHue = isMelody ? MELODY_CELL[0] : dHue(drum.hue);
+        fill(dotHue,28,isBeat?60:80,75); noStroke(); circle(x0+cellW/2,rowY+rowH/2,isBeat?3:1.8);
       }
     }
   });
@@ -1644,62 +1866,45 @@ function drawSequencer() {
     stroke(...ACCENT); strokeWeight(2.5); noFill(); line(SEQ_MARGIN,lineY,SEQ_MARGIN+(cW()-SEQ_MARGIN*2),lineY);
   }
 
-  // + seq big plus (below last slot)
+  // Two add-slot buttons: drum + melody (below last slot)
   const lastSlot=slots[slots.length-1];
   const lastGridTop=getSlotGridTop(slots.length-1,gridTop,seqRowHeight);
   const numLastRows=Math.max(1,getSeqPads(lastSlot).length);
-  const addSlotY=lastGridTop+numLastRows*seqRowHeight+20;
-  const addSlotCenterX=SEQ_MARGIN+SEQ_LABEL_W+seqW/2, addSlotCenterY=addSlotY+20;
+  const addSlotY=lastGridTop+numLastRows*slotRowHeight(lastSlot, seqRowHeight)+20;
+  const addSlotCenterY=addSlotY+20;
+  const addSlotGap=40;
+  const addSlotMidX=SEQ_MARGIN+SEQ_LABEL_W+seqW/2;
+  const addDrumX=addSlotMidX-addSlotGap/2-12;
+  const addMelodyX=addSlotMidX+addSlotGap/2+12;
   const effMouseYAddSlot=mY()+seqScrollY;
-  const addSlotHov=abs(mX()-addSlotCenterX)<24&&abs(effMouseYAddSlot-addSlotCenterY)<18&&mY()>=gridTop;
-  _drawPlus(addSlotCenterX, addSlotCenterY, addSlotHov);
+  const addDrumHov=abs(mX()-addDrumX)<18&&abs(effMouseYAddSlot-addSlotCenterY)<18&&mY()>=gridTop;
+  const addMelodyHov=abs(mX()-addMelodyX)<18&&abs(effMouseYAddSlot-addSlotCenterY)<18&&mY()>=gridTop;
+
+  // Drum add button: + with grid dots icon
+  _drawPlus(addDrumX, addSlotCenterY, addDrumHov);
+  push(); noStroke();
+  fill(addDrumHov ? [...ACCENT] : [...INK_DIM]);
+  // 2x3 dot grid icon
+  for (let r=0;r<2;r++) for (let c=0;c<3;c++)
+    circle(addDrumX+6+c*3, addSlotCenterY+6+r*3, 1.5);
+  pop();
+
+  // Melody add button: + with piano-roll lines icon
+  _drawPlus(addMelodyX, addSlotCenterY, addMelodyHov);
+  push(); noStroke();
+  fill(addMelodyHov ? [...ACCENT] : [...INK_DIM]);
+  // Horizontal lines icon (piano roll)
+  for (let r=0;r<3;r++) {
+    rect(addMelodyX+4, addSlotCenterY+5+r*3, 8, 1.2, 0.5);
+  }
+  pop();
 
   pop();
   drawingContext.restore();
 
-  // Cell pitch dropdown (rendered outside clip region so it's not clipped)
-  drawCellPitchDropdown();
-
   drawSeqScrollbar(gridTop, visibleHeight, seqRowHeight);
 }
 
-function drawCellPitchDropdown() {
-  if (!cellPitchDropdown) return;
-  const d = cellPitchDropdown;
-  const itemH = 13, menuW = 22;
-  const totalItems = 25; // +12 to -12
-  const totalH = totalItems * itemH;
-  const zeroIdx = 12; // index of the "0" item
-  // Center the "0" row on the cell's vertical center
-  const menuY = d.y + d.cellH / 2 - (zeroIdx + 0.5) * itemH;
-  const menuX = d.x + d.cellW / 2 - menuW / 2;
-  const clampedY = constrain(menuY, 2, cH() / UI_SCALE - totalH - 2);
-  const clampedX = constrain(menuX, 2, cW() / UI_SCALE - menuW - 2);
-
-  // Background
-  fill(...PANEL); stroke(...INK_FAINT); strokeWeight(0.5);
-  rect(clampedX - 2, clampedY - 2, menuW + 4, totalH + 4, 3);
-
-  for (let i = 0; i < totalItems; i++) {
-    const val = 12 - i;
-    const iy = clampedY + i * itemH;
-    const hov = mX() > clampedX && mX() < clampedX + menuW && mY() > iy && mY() < iy + itemH;
-    const isCur = (val === d.currentPitch);
-
-    if (isCur) { fill(...ACCENT); noStroke(); rect(clampedX, iy, menuW, itemH, 1); }
-    else if (hov) { fill(ACCENT[0], ACCENT[1], ACCENT[2], 25); noStroke(); rect(clampedX, iy, menuW, itemH, 1); }
-
-    if (val === 0) {
-      fill(isCur ? [0, 0, 100] : INK); strokeWeight(0.3); stroke(...INK_FAINT);
-      line(clampedX + 2, iy, clampedX + menuW - 2, iy);  // separator above 0
-      line(clampedX + 2, iy + itemH, clampedX + menuW - 2, iy + itemH); // separator below 0
-    }
-    fill(isCur ? [0, 0, 100] : (val === 0 ? INK : INK_DIM));
-    noStroke(); textSize(6); textAlign(CENTER, CENTER);
-    text(val === 0 ? '0' : (val > 0 ? '+' + val : '' + val), clampedX + menuW / 2, iy + itemH / 2);
-    if (hov) cursor(HAND);
-  }
-}
 
 // ── Overlays ─────────────────────────────────────────────────────────────────
 

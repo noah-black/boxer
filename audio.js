@@ -61,6 +61,42 @@ function posToStep(pos, stepPositions) {
   return stepPositions.length-2;
 }
 
+// ── Trim drag computation (pure function, unit-testable) ─────────────────────
+
+/**
+ * Maps mouse X position to proposed trim fractions.
+ * The bar is a viewport over [origStart, origEnd]. Mouse position maps linearly
+ * to a fraction at a constant rate — same speed inside and outside the bar.
+ * No direction-dependent scaling, no discontinuities.
+ *
+ * @param {string} type - 'trimStart' or 'trimEnd'
+ * @param {number} mouseX - current mouse X position
+ * @param {number} barX - left edge of the trim bar (pixels)
+ * @param {number} barW - width of the trim bar (pixels)
+ * @param {number} origStart - trim start fraction at drag start
+ * @param {number} origEnd - trim end fraction at drag start
+ * @returns {{ proposedStart: number, proposedEnd: number }}
+ */
+// Minimum trim duration in seconds — enough samples for WSOLA at 4x speed
+const MIN_TRIM_SECS = 0.01;
+
+function computeTrimDrag(type, mouseX, barX, barW, origStart, origEnd, ctxDuration) {
+  const minGap = ctxDuration > 0 ? MIN_TRIM_SECS / ctxDuration : 0.001;
+  const vpRange = Math.max(origEnd - origStart, 0.001);
+  const frac = origStart + (mouseX - barX) / barW * vpRange;
+  if (type === 'trimStart') {
+    return {
+      proposedStart: Math.max(0, Math.min(frac, origEnd - minGap)),
+      proposedEnd: origEnd,
+    };
+  } else {
+    return {
+      proposedStart: origStart,
+      proposedEnd: Math.max(origStart + minGap, Math.min(frac, 1)),
+    };
+  }
+}
+
 // ── Sequencer ────────────────────────────────────────────────────────────────
 
 let _totalLoops = 0;
@@ -114,12 +150,35 @@ function scheduleLoop() {
       if (!slotSilenced) {
         const mCells=grid.measures[measureIdx].cells;
         const mCP=grid.measures[measureIdx].cellPitch;
-        getActivePads(slot).forEach(drum => {
-          if (mCells[drum.id]&&mCells[drum.id][stepInMeasure]) {
-            const cp=(mCP&&mCP[drum.id])?(mCP[drum.id][stepInMeasure]||0):0;
-            triggerDrumAtTime(slot,drum.id,time,cp);
-          }
-        });
+        if (slot.type === 'melody') {
+          const soundId = slot.melodySoundPadId;
+          Object.keys(mCells).forEach(noteId => {
+            if (mCells[noteId] && mCells[noteId][stepInMeasure]) {
+              const noteIdx = parseInt(noteId.slice(1));
+              const cellPitch = noteIdx - MELODY_CENTER;
+              triggerDrumAtTime(slot, soundId, time, cellPitch, stepInMeasure);
+              // Store glow with noteId key so notes don't collide on same soundId
+              const glowSi = slots.indexOf(slot);
+              const glowTs = slot.drumTrimStart[soundId] ?? 0, glowTe = slot.drumTrimEnd[soundId] ?? 1;
+              const cands = slot.drumCandidates[soundId];
+              const cand = cands && cands[slot.drumIdx[soundId] || 0];
+              if (cand) {
+                let clipDurSec;
+                if (cand.buffer) clipDurSec = cand.buffer.duration * (glowTe - glowTs);
+                else clipDurSec = ((cand.ctxEnd || 1) - (cand.ctxStart || 0)) * (glowTe - glowTs);
+                const delayMs = Math.max(0, (time - audioCtx.currentTime)) * 1000;
+                _cellGlow[glowSi + '_' + noteId + '_' + stepInMeasure] = { triggerMs: millis() + delayMs, durationMs: clipDurSec * 1000 };
+              }
+            }
+          });
+        } else {
+          getActivePads(slot).forEach(drum => {
+            if (mCells[drum.id]&&mCells[drum.id][stepInMeasure]) {
+              const cp=(mCP&&mCP[drum.id])?(mCP[drum.id][stepInMeasure]||0):0;
+              triggerDrumAtTime(slot,drum.id,time,cp,stepInMeasure);
+            }
+          });
+        }
       }
       if (slotIndex===0&&seqRecording&&stepInMeasure%4===0&&stepInMeasure>0)
         scheduleMetronomeClick(time,false);
@@ -181,6 +240,7 @@ function renderPitchedBuffer(inputBuffer, semitones, speed) {
 
   // De-interleave into AudioBuffer, clamped to expectedLen
   const actualLen = Math.min(totalFrames, expectedLen);
+  if (actualLen < 1) return audioCtx.createBuffer(nChan, 1, sr); // safety: avoid 0-frame error
   const result = audioCtx.createBuffer(nChan, actualLen, sr);
   const outL = result.getChannelData(0);
   const outR = nChan > 1 ? result.getChannelData(1) : null;
@@ -268,15 +328,19 @@ function playCandidate(slot, id, cand, when, volScale=1.0, cellPitch=0) {
     ts=drag.proposedStart??ts; te=drag.proposedEnd??te;
   }
   let dest=gainNodes[id];
-  // EQ filter chain (use live draft if modal is open for this pad)
-  let eq = slot.drumEQ[id] || null;
-  if (eq && (eq.low !== 0 || eq.mid !== 0 || eq.high !== 0)) {
-    const lo=audioCtx.createBiquadFilter(); lo.type='lowshelf'; lo.frequency.value=EQ_LOW_FREQ; lo.gain.value=eq.low;
-    const md=audioCtx.createBiquadFilter(); md.type='peaking'; md.frequency.value=EQ_MID_FREQ; md.Q.value=EQ_MID_Q; md.gain.value=eq.mid;
-    const hi=audioCtx.createBiquadFilter(); hi.type='highshelf'; hi.frequency.value=EQ_HIGH_FREQ; hi.gain.value=eq.high;
-    lo.connect(md); md.connect(hi); hi.connect(dest); dest=lo;
+  // EQ filter chain — skip when all gains are zero to avoid BiquadFilter instability
+  // on short/high-pitched WSOLA buffers
+  const eq = slot.drumEQ[id] || { low: 0, mid: 0, high: 0 };
+  const hasEQ = eq.low !== 0 || eq.mid !== 0 || eq.high !== 0;
+  let eqLo=null, eqMd=null, eqHi=null;
+  if (hasEQ) {
+    eqLo=audioCtx.createBiquadFilter(); eqLo.type='lowshelf'; eqLo.frequency.value=EQ_LOW_FREQ; eqLo.gain.value=eq.low;
+    eqMd=audioCtx.createBiquadFilter(); eqMd.type='peaking'; eqMd.frequency.value=EQ_MID_FREQ; eqMd.Q.value=EQ_MID_Q; eqMd.gain.value=eq.mid;
+    eqHi=audioCtx.createBiquadFilter(); eqHi.type='highshelf'; eqHi.frequency.value=EQ_HIGH_FREQ; eqHi.gain.value=eq.high;
+    eqLo.connect(eqMd); eqMd.connect(eqHi); eqHi.connect(dest); dest=eqLo;
   }
-  if (effectiveVol!==1.0) { const gainNode=audioCtx.createGain(); gainNode.gain.value=effectiveVol; gainNode.connect(dest); dest=gainNode; }
+  // Volume gain — always created so we can live-update
+  const volGain=audioCtx.createGain(); volGain.gain.value=effectiveVol; volGain.connect(dest); dest=volGain;
 
   if (needWSola) {
     // Extract just the trimmed region (+ small margin) for WSOLA processing,
@@ -331,12 +395,69 @@ function playCandidate(slot, id, cand, when, volScale=1.0, cellPitch=0) {
     const duration=(te-ts)*ctxDur;
     src.start(when,offset,duration);
   }
+  // Track active sound for live parameter updates
+  const entry = { src, volGain, eqLo, eqMd, eqHi, volScale, slotIdx: si, wsola: needWSola };
+  if (!_activeSounds[id]) _activeSounds[id] = [];
+  _activeSounds[id].push(entry);
+  src.onended = () => {
+    const arr = _activeSounds[id];
+    if (arr) { const idx = arr.indexOf(entry); if (idx >= 0) arr.splice(idx, 1); }
+  };
 }
 
-function triggerDrumAtTime(slot, id, when, cellPitch=0) {
+function triggerDrumAtTime(slot, id, when, cellPitch=0, step=-1) {
   const cands=slot.drumCandidates[id]; if (!cands||!cands.length) return;
   const cand=cands[slot.drumIdx[id]||0]; if (!cand) return;
   playCandidate(slot,id,cand,when,slot.gridVolume??1.0,cellPitch);
+  // Record cell glow for visual feedback
+  if (step >= 0) {
+    const si = slots.indexOf(slot);
+    const ts=slot.drumTrimStart[id]??0, te=slot.drumTrimEnd[id]??1;
+    const baseSemitones = slot.drumPitch[id] ?? 0;
+    const linked = slot.drumPitchSpeedLinked[id] ?? true;
+    const forceWSola = cellPitch !== 0;
+    const speed = (linked && !forceWSola) ? Math.pow(2, (baseSemitones + cellPitch)/12) : (slot.drumSpeed[id] ?? 1.0);
+    let clipDurSec;
+    if (cand.buffer) {
+      clipDurSec = cand.buffer.duration * (te - ts);
+    } else {
+      const ctxDur = (cand.ctxEnd || 1) - (cand.ctxStart || 0);
+      clipDurSec = ctxDur * (te - ts);
+    }
+    const effectiveDur = clipDurSec / Math.abs(speed || 1);
+    const delayMs = Math.max(0, (when - (audioCtx ? audioCtx.currentTime : 0))) * 1000;
+    _cellGlow[si + '_' + id + '_' + step] = { triggerMs: millis() + delayMs, durationMs: effectiveDur * 1000 };
+  }
+}
+
+// ── Live parameter updates for playing sounds ───────────────────────────────
+
+function updateLiveVolume(slotIdx, id) {
+  const slot = slots[slotIdx]; if (!slot) return;
+  const vol = slot.drumVolumes[id] ?? 0.8;
+  for (const e of (_activeSounds[id] || []))
+    if (e.slotIdx === slotIdx) e.volGain.gain.value = vol * e.volScale;
+}
+
+function updateLiveEQ(slotIdx, id) {
+  const slot = slots[slotIdx]; if (!slot) return;
+  const eq = slot.drumEQ[id] || { low: 0, mid: 0, high: 0 };
+  for (const e of (_activeSounds[id] || []))
+    if (e.slotIdx === slotIdx && e.eqLo) {
+      e.eqLo.gain.value = eq.low;
+      e.eqMd.gain.value = eq.mid;
+      e.eqHi.gain.value = eq.high;
+    }
+}
+
+function updateLivePitch(slotIdx, id) {
+  const slot = slots[slotIdx]; if (!slot) return;
+  const semitones = slot.drumPitch[id] ?? 0;
+  const linked = slot.drumPitchSpeedLinked[id] ?? true;
+  if (!linked) return;
+  const rate = Math.pow(2, semitones / 12);
+  for (const e of (_activeSounds[id] || []))
+    if (e.slotIdx === slotIdx && !e.wsola) e.src.playbackRate.value = rate;
 }
 
 function triggerDrum(id) {
@@ -344,7 +465,20 @@ function triggerDrum(id) {
   const cands=slot.drumCandidates[id]; if (!cands||!cands.length) return;
   const cand=cands[slot.drumIdx[id]||0]; if (!cand) return;
   if (audioCtx.state==='suspended') audioCtx.resume();
-  playCandidate(slot,id,cand,0); padFlash[id]=millis();
+  playCandidate(slot,id,cand,0,slot.gridVolume??1.0); padFlash[id]=millis();
+}
+
+function triggerMelodyNote(slot, noteId) {
+  const soundId = slot.melodySoundPadId;
+  const cands = slot.drumCandidates[soundId];
+  if (!cands || !cands.length) return;
+  const cand = cands[slot.drumIdx[soundId] || 0];
+  if (!cand) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  const noteIdx = parseInt(noteId.slice(1));
+  const cellPitch = noteIdx - MELODY_CENTER;
+  playCandidate(slot, soundId, cand, 0, slot.gridVolume ?? 1.0, cellPitch);
+  padFlash[noteId] = millis();
 }
 
 function scheduleMetronomeClick(when, isDownbeat) {
@@ -493,17 +627,30 @@ async function submitAudio(blob) {
 
   slot.sourceBuffer=newSourceBuffer; slot.sessionId=data.session_id||null; slot.reuploadPending=false;
   slot.analyzeResults=data.drums||{};
-  // Re-populate existing pads from new results
-  slot.activePadIds.forEach(id=>{
-    slot.drumCandidates[id]=[]; slot.drumIdx[id]=0;
-    slot.drumTrimStart[id]=0; slot.drumTrimEnd[id]=1;
-    if (slot.padMode[id]==='prototype') {
-      const protoName=(slot.padText[id]||'').trim();
-      if (protoName && slot.analyzeResults[protoName]) {
-        applyPrototype(slot, id, protoName);
+  if (slot.type === 'melody') {
+    // Melody slots use the full source buffer as a single candidate
+    const soundId = slot.melodySoundPadId;
+    const dur = newSourceBuffer.duration;
+    slot.drumCandidates[soundId] = [{ ctxStart: 0, ctxEnd: dur, trimStart: 0, trimEnd: 1, normGain: 1.0, score: 1, time: 0 }];
+    slot.drumIdx[soundId] = 0;
+    slot.drumTrimStart[soundId] = 0;
+    slot.drumTrimEnd[soundId] = 1;
+    slot.padMode[soundId] = 'prototype';
+    slot.padFinalized[soundId] = true;
+    slot.padText[soundId] = slot.fileName || 'sound';
+  } else {
+    // Re-populate existing pads from new results
+    slot.activePadIds.forEach(id=>{
+      slot.drumCandidates[id]=[]; slot.drumIdx[id]=0;
+      slot.drumTrimStart[id]=0; slot.drumTrimEnd[id]=1;
+      if (slot.padMode[id]==='prototype') {
+        const protoName=(slot.padText[id]||'').trim();
+        if (protoName && slot.analyzeResults[protoName]) {
+          applyPrototype(slot, id, protoName);
+        }
       }
-    }
-  });
+    });
+  }
   slot.analyzing=false;
   rebuildKbdMap(); positionSharedInput(); updateElementVisibility();
   if (phase!=='ready') setPhase('ready');
@@ -550,20 +697,22 @@ function confirmCustomClip() {
   stopTrimPreview();
   const { padId, trimStart, trimEnd } = trimState;
   const slot = currentSlot();
-  slot.drumCandidates[padId] = [{
+  const sourceDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 1;
+  const cand = widenCandidateContext({
     ctxStart: trimStart,
     ctxEnd: trimEnd,
     trimStart: 0,
     trimEnd: 1,
     score: 1.0,
     time: trimStart,
-  }];
+  }, sourceDur);
+  slot.drumCandidates[padId] = [cand];
   slot.drumIdx[padId] = 0;
-  slot.drumTrimStart[padId] = 0;
-  slot.drumTrimEnd[padId] = 1;
+  slot.drumTrimStart[padId] = cand.trimStart;
+  slot.drumTrimEnd[padId] = cand.trimEnd;
   slot.padMode[padId] = 'custom';
   slot.padFinalized[padId] = true;
-  slot.padText[padId] = trimStart.toFixed(1) + '\u2013' + trimEnd.toFixed(1) + 's';
+  slot.padText[padId] = labelForTimeRange(slot, trimStart, trimEnd);
   trimState = null;
   setPhase('ready');
   syncSharedInput(); positionSharedInput();
@@ -663,6 +812,31 @@ function applyLyricsQuery(slot, id) {
   }
 }
 
+// ── Trim-based label generation ──────────────────────────────────────────────
+
+function updateTrimLabel(slot, id) {
+  const mode = slot.padMode[id];
+  if (mode === 'prototype' || mode === 'record') return; // prototypes keep their name, record keeps vocab label
+  const ts = slot.drumTrimStart[id] || 0, te = slot.drumTrimEnd[id] ?? 1;
+  const dur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
+  if (dur <= 0) return;
+  const absStart = ts * dur, absEnd = te * dur;
+  const label = labelForTimeRange(slot, absStart, absEnd);
+  slot.padText[id] = label;
+  slot.padFinalized[id] = true;
+  syncSharedInput();
+}
+
+function labelForTimeRange(slot, startSec, endSec) {
+  // Find transcript words that overlap this time range
+  if (slot.lyricsTranscript && slot.lyricsTranscript.length > 0) {
+    const words = slot.lyricsTranscript.filter(w => w.end > startSec && w.start < endSec);
+    if (words.length > 0) return words.map(w => w.word).join(' ');
+  }
+  // Fallback: timestamp form
+  return startSec.toFixed(1) + '\u2013' + endSec.toFixed(1) + 's';
+}
+
 // ── Prototype assignment ─────────────────────────────────────────────────────
 
 function applyPrototype(slot, padId, prototypeName, silent=false) {
@@ -691,7 +865,7 @@ function applyPrototype(slot, padId, prototypeName, silent=false) {
 async function saveSession() {
   const zip = new JSZip();
   const manifest = {
-    version: 2,
+    version: 3,
     savedAt: new Date().toISOString(),
     seqBPM,
     selectedSlotIdx,
@@ -704,8 +878,11 @@ async function saveSession() {
     const slot = slots[si];
     const slotData = {
       index: si,
+      type: slot.type || 'drum',
       fileName: slot.fileName,
       sourceWavPath: null,
+      melodyOctave: slot.melodyOctave,
+      melodySoundPadId: slot.melodySoundPadId,
       grid: {
         steps: slot.grid.steps,
         measures: slot.grid.measures.map(m => ({
@@ -841,7 +1018,7 @@ async function loadSession() {
   const zip = await JSZip.loadAsync(file);
   const manifestText = await zip.file('manifest.json').async('string');
   const manifest = JSON.parse(manifestText);
-  if (manifest.version !== 1 && manifest.version !== 2) { errorMsg = 'Unsupported session version'; setPhase('error'); return; }
+  if (manifest.version !== 1 && manifest.version !== 2 && manifest.version !== 3) { errorMsg = 'Unsupported session version'; setPhase('error'); return; }
 
   // Stop sequencer, clear state
   if (seqPlaying) stopSequencer();
@@ -857,8 +1034,12 @@ async function loadSession() {
   const loadedSlots = [];
   for (let si = 0; si < manifest.slots.length; si++) {
     const sd = manifest.slots[si];
-    const slot = createSlot();
+    const slot = createSlot(sd.type || 'drum');
     slot.fileName = sd.fileName;
+    if (slot.type === 'melody') {
+      slot.melodyOctave = sd.melodyOctave ?? 2;
+      slot.melodySoundPadId = sd.melodySoundPadId ?? 'pad_0';
+    }
     slot.grid.steps = sd.grid.steps ?? 16;
     slot.gridVolume = sd.gridVolume ?? 1.0;
     slot.swing = sd.swing ?? 0;
@@ -936,14 +1117,24 @@ async function loadSession() {
   _nextSteps = slots.map(() => 0);
   selectedSlotIdx = Math.min(manifest.selectedSlotIdx ?? 0, slots.length - 1);
   selectedPadId = currentSlot().activePadIds[0] || null;
-  // Mark slots for re-analysis before updating visibility
-  slots.forEach(slot => { if (slot.sourceBuffer) slot.analyzing = true; });
+  // Mark slots for re-analysis before updating visibility (melody slots skip analysis)
+  slots.forEach(slot => { if (slot.sourceBuffer && slot.type !== 'melody') slot.analyzing = true; });
   syncSharedInput(); rebuildKbdMap(); positionSharedInput(); updateElementVisibility();
 
   // Re-analyze slots that have source audio (async, parallel)
   slots.forEach((slot, si) => {
     const sd = manifest.slots[si];
     if (!slot.sourceBuffer || !sd) return;
+    // Melody slots use full source as candidate — no re-analysis needed
+    if (slot.type === 'melody') {
+      const soundId = slot.melodySoundPadId;
+      if (!slot.drumCandidates[soundId] || slot.drumCandidates[soundId].length === 0) {
+        const dur = slot.sourceBuffer.duration;
+        slot.drumCandidates[soundId] = [{ ctxStart: 0, ctxEnd: dur, trimStart: 0, trimEnd: 1, normGain: 1.0, score: 1, time: 0 }];
+      }
+      slot.analyzing = false;
+      return;
+    }
     const wav = audioBufferToWav(slot.sourceBuffer, 0, slot.sourceBuffer.duration);
     const wavBlob = new Blob([wav], { type: 'audio/wav' });
 

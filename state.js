@@ -12,12 +12,42 @@ function getActivePads(slot) {
   return slot.activePadIds.map(id => getPadDef(id));
 }
 
-/** Get pads visible in the sequencer (with content). */
+/** Get pads/rows visible in the sequencer.
+ *  For drum slots: active pads with content.
+ *  For melody slots: 13 rows (C to next C) for the current octave, high-to-low. */
 function getSeqPads(slot) {
+  if (slot.type === 'melody') {
+    const rows = [];
+    const base = slot.melodyOctave * 12;
+    // 13 rows: from top C down to bottom C (high pitch at top)
+    for (let i = 12; i >= 0; i--) {
+      const noteIdx = base + i;
+      if (noteIdx >= MELODY_TOTAL_NOTES) continue;
+      const semitone = noteIdx - MELODY_CENTER;
+      const noteName = NOTE_NAMES[i % 12];
+      const isBlack = noteName.includes('#');
+      // Relative octave label: octave 2 = base (no suffix), others show offset
+      const octLabel = slot.melodyOctave === 2 ? '' :
+                       slot.melodyOctave < 2 ? (slot.melodyOctave - 2) + '' : '+' + (slot.melodyOctave - 2);
+      // Top C of an octave gets next octave's label
+      const label = i === 12
+        ? NOTE_NAMES[0] + (slot.melodyOctave === 1 ? '' : slot.melodyOctave < 1 ? (slot.melodyOctave - 1) + '' : '+' + (slot.melodyOctave - 1))
+        : noteName + octLabel;
+      rows.push({ id: 'm' + noteIdx, name: label, isBlack, hue: 210, semitone });
+    }
+    return rows;
+  }
   return getActivePads(slot).filter(def => {
     const textValue = (slot.padText[def.id] || '').trim();
     return (slot.drumCandidates[def.id] && slot.drumCandidates[def.id].length > 0) || textValue !== '';
   });
+}
+
+/** Get all 49 row IDs for a melody slot (used by measure/step helpers). */
+function getAllMelodyRowIds() {
+  const ids = [];
+  for (let i = 0; i < MELODY_TOTAL_NOTES; i++) ids.push('m' + i);
+  return ids;
 }
 
 // ── Global (non-slot) state ──────────────────────────────────────────────────
@@ -44,7 +74,8 @@ let recStart = 0, analyserNode = null, waveformData = null;
 let audioCtx = null, uploadEl = null;
 let pickerOpen = false, pickerSlot = null, pickerPadId = null;
 let pickerSel = [], pickerAnchor = null, pickerEl = null, pickerDragging = false;
-let cellPitchDropdown = null; // { slotIdx, padId, stepIdx, x, y, cellW, cellH, currentPitch }
+let _activeSounds = {}; // padId → [{ src, volGain, eqLo, eqMd, eqHi, volScale, slotIdx, wsola }]
+let _cellGlow = {}; // "slotIdx_drumId" → { triggerMs, durationMs }
 let errorMsg = '', spinAngle = 0;
 let trimState = null;
 let trimPlaySrc = null;
@@ -66,10 +97,17 @@ function invalidatePitchedCache(si, id) {
 let _kbdMap = {};
 function rebuildKbdMap() {
   _kbdMap = {};
-  currentSlot().activePadIds.forEach((id, i) => {
-    // Assign keys by position so they're always a contiguous prefix of ASDFGHJKZXCVBNM,
-    if (i < PAD_DEFS.length) _kbdMap[PAD_DEFS[i].kbd.toLowerCase()] = id;
-  });
+  const slot = currentSlot();
+  if (slot.type === 'melody') {
+    MELODY_KBD.forEach(e => {
+      const noteIdx = slot.melodyOctave * 12 + e.semitone;
+      if (noteIdx < MELODY_TOTAL_NOTES) _kbdMap[e.key] = 'm' + noteIdx;
+    });
+  } else {
+    slot.activePadIds.forEach((id, i) => {
+      if (i < PAD_DEFS.length) _kbdMap[PAD_DEFS[i].kbd.toLowerCase()] = id;
+    });
+  }
 }
 /** Get the display key for a pad based on its position (not its fixed PAD_DEFS key). */
 function padDisplayKey(id) {
@@ -80,12 +118,28 @@ rebuildKbdMap();
 
 // ── Slot management ──────────────────────────────────────────────────────────
 
-function addSlot() {
-  const slot = createSlot();
-  ensureAllPads(slot);
+function addSlot(type) {
+  const slot = createSlot(type);
+  if (type === 'melody') {
+    initMelodySlot(slot);
+  } else {
+    ensureAllPads(slot);
+  }
   slots.push(slot);
   if (seqPlaying) { _nextSteps.push(0); _measurePhase.push(0); }
   selectSlot(slots.length-1);
+}
+
+/** Initialize a melody slot with its single sound pad. */
+function initMelodySlot(slot) {
+  const def = getPadDef(slot.melodySoundPadId);
+  _addPadToSlot(slot, def);
+}
+
+/** Set the visible octave for a melody slot. */
+function setMelodyOctave(slot, oct) {
+  slot.melodyOctave = Math.max(0, Math.min(oct, MELODY_OCTAVE_COUNT - 1));
+  rebuildKbdMap();
 }
 
 function clearAllSlots() {
@@ -109,7 +163,7 @@ function removeSlot(slotIndex) {
 }
 
 function duplicateSlot(slotIndex) {
-  const src = slots[slotIndex], dst = createSlot();
+  const src = slots[slotIndex], dst = createSlot(src.type);
   dst.grid = {
     steps: src.grid.steps,
     measures: src.grid.measures.map(m => ({
@@ -121,6 +175,10 @@ function duplicateSlot(slotIndex) {
   dst.gridVolume = src.gridVolume; dst.swing = src.swing??0; dst.humanize = src.humanize??0;
   dst.muted = src.muted; dst.soloed = src.soloed;
   dst.humanizeSeeds = [...(src.humanizeSeeds||makeHumanizeSeeds())];
+  if (src.type === 'melody') {
+    dst.melodyOctave = src.melodyOctave;
+    dst.melodySoundPadId = src.melodySoundPadId;
+  }
   src.activePadIds.forEach(id => {
     dst.drumCandidates[id] = [...(src.drumCandidates[id] || [])];
     dst.drumIdx[id]       = src.drumIdx[id] || 0;
@@ -208,9 +266,14 @@ function _addPadToSlot(slot, def) {
   }
 }
 
-/** Ensure all 16 PAD_DEFS are active in a slot. Called after audioCtx is available. */
+/** Ensure all 16 PAD_DEFS are active in a slot. Called after audioCtx is available.
+ *  For melody slots, only ensure the single sound pad. */
 function ensureAllPads(slot) {
-  PAD_DEFS.forEach(def => _addPadToSlot(slot, def));
+  if (slot.type === 'melody') {
+    initMelodySlot(slot);
+  } else {
+    PAD_DEFS.forEach(def => _addPadToSlot(slot, def));
+  }
 }
 
 /** Re-initialize a pad: clear its sound and restore the editable state. */
@@ -234,9 +297,10 @@ function addMeasure(slotIndex) {
   const slot = slots[slotIndex], grid = slot.grid;
   if (grid.measures.length >= MAX_MEASURES) return;
   const newCells = {}, newCellPitch = {};
-  getActivePads(slot).forEach(def => {
-    newCells[def.id] = new Array(grid.steps).fill(false);
-    newCellPitch[def.id] = new Array(grid.steps).fill(0);
+  const rowIds = slot.type === 'melody' ? getAllMelodyRowIds() : getActivePads(slot).map(d => d.id);
+  rowIds.forEach(id => {
+    newCells[id] = new Array(grid.steps).fill(false);
+    newCellPitch[id] = new Array(grid.steps).fill(0);
   });
   grid.measures.push({ cells: newCells, cellPitch: newCellPitch });
   grid.editMeasure = grid.measures.length - 1;
@@ -297,18 +361,19 @@ function setStepCount(slotIndex, newSteps) {
   if (newSteps === slot.grid.steps) return;
   // Extend arrays if growing, but never shrink — preserves steps beyond the visible range
   if (newSteps > slot.grid.steps) {
+    const rowIds = slot.type === 'melody' ? getAllMelodyRowIds() : getActivePads(slot).map(d => d.id);
     slot.grid.measures.forEach(m => {
       if (!m.cellPitch) m.cellPitch = {};
-      getActivePads(slot).forEach(def => {
-        const old = m.cells[def.id];
+      rowIds.forEach(id => {
+        const old = m.cells[id];
         if (old && old.length < newSteps) {
-          m.cells[def.id] = old.concat(new Array(newSteps - old.length).fill(false));
+          m.cells[id] = old.concat(new Array(newSteps - old.length).fill(false));
         }
-        const oldP = m.cellPitch[def.id];
+        const oldP = m.cellPitch[id];
         if (oldP && oldP.length < newSteps) {
-          m.cellPitch[def.id] = oldP.concat(new Array(newSteps - oldP.length).fill(0));
+          m.cellPitch[id] = oldP.concat(new Array(newSteps - oldP.length).fill(0));
         } else if (!oldP) {
-          m.cellPitch[def.id] = new Array(newSteps).fill(0);
+          m.cellPitch[id] = new Array(newSteps).fill(0);
         }
       });
     });

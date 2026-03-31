@@ -164,6 +164,26 @@ def nearest_vocab(audio_embed: np.ndarray, top_k: int = 5) -> list[dict]:
 log.info("Prototypes ready.")
 
 
+# ── Demucs (lazy-loaded) ──────────────────────────────────────────────────────
+
+_demucs_model = None
+
+
+def get_demucs():
+    """Lazy-load the Demucs source separation model on first request."""
+    global _demucs_model
+    if _demucs_model is None:
+        try:
+            from demucs.pretrained import get_model
+            log.info("Loading Demucs 'htdemucs' ...")
+            _demucs_model = get_model("htdemucs")
+            _demucs_model.eval()
+            log.info("Demucs ready.")
+        except ImportError:
+            log.warning("demucs not installed")
+    return _demucs_model
+
+
 # ── Whisper (lazy-loaded) ─────────────────────────────────────────────────────
 
 _whisper_model = None

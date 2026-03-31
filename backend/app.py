@@ -15,10 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from backend.constants import SAMPLE_RATE, SESSION_TTL, N_CANDIDATES
+from fastapi.responses import Response
+
 from backend.models import (
-    embed_audio_arrays, embed_texts, nearest_vocab, transcribe_audio,
+    embed_audio_arrays, embed_texts, nearest_vocab, transcribe_audio, get_demucs,
 )
-from backend.dsp import load_audio, clip_to_base64_wav, detect_onsets, extract_clips, clip_to_context_times
+from backend.dsp import load_audio, clip_to_base64_wav, detect_onsets, extract_clips, clip_to_context_times, numpy_to_wav_bytes
 from backend.analysis import run_drum_assignment, run_custom_text_queries
 
 log = logging.getLogger(__name__)
@@ -222,6 +224,36 @@ async def query_custom(
             return {"candidates": candidates, "mode": "clap"}
         except Exception as exc:
             raise HTTPException(500, f"CLAP query failed: {exc}")
+
+
+@app.post("/separate")
+async def separate(file: UploadFile = File(...), stem: str = Form(default="vocals")):
+    """Separate audio into stems using Demucs, return the requested stem as WAV."""
+    valid_stems = {"vocals": 3, "drums": 0, "bass": 1, "other": 2}
+    if stem not in valid_stems:
+        raise HTTPException(400, f"Invalid stem '{stem}'. Choose from: {list(valid_stems)}")
+
+    model = get_demucs()
+    if model is None:
+        raise HTTPException(503, "Demucs model not available (not installed)")
+
+    raw = await file.read()
+    audio = load_audio(raw)
+
+    # Demucs expects (batch, channels, samples) — duplicate mono to stereo
+    wav_tensor = torch.from_numpy(audio).float().unsqueeze(0).expand(2, -1).unsqueeze(0)
+
+    from demucs.apply import apply_model
+    with torch.no_grad():
+        sources = apply_model(model, wav_tensor, device="cpu")
+    # sources: (1, n_sources, 2, samples) — htdemucs order: drums, bass, other, vocals
+
+    stem_idx = valid_stems[stem]
+    stem_audio = sources[0, stem_idx].mean(dim=0).cpu().numpy()  # stereo → mono
+
+    wav_bytes = numpy_to_wav_bytes(stem_audio, SAMPLE_RATE)
+    log.info(f"Separated '{stem}' from {len(audio)/SAMPLE_RATE:.1f}s audio")
+    return Response(content=wav_bytes, media_type="audio/wav")
 
 
 @app.get("/prototypes")

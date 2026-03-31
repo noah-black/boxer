@@ -54,6 +54,7 @@ function getAllMelodyRowIds() {
 let phase = 'ready';
 let gainNodes = {};
 let padFlash  = {};
+let _padFlashDur = {}; // duration in ms for melody pad flashes (keyed by noteId)
 let padHeld   = {};
 let drag      = null;
 let seqBPM      = 120;
@@ -78,6 +79,7 @@ let _activeSounds = {}; // padId → [{ src, volGain, eqLo, eqMd, eqHi, volScale
 let _cellGlow = {}; // "slotIdx_drumId" → { triggerMs, durationMs }
 let errorMsg = '', spinAngle = 0;
 let trimState = null;
+let trimStemMode = 'full'; // 'full' | 'vocals' | 'drums'
 let trimPlaySrc = null;
 let trimPlayStartTime = 0, trimPlayStartSec = 0;
 let selectedPadId = null;
@@ -184,6 +186,10 @@ function duplicateSlot(slotIndex) {
     dst.drumIdx[id]       = src.drumIdx[id] || 0;
     dst.drumVolumes[id]   = src.drumVolumes[id] ?? 0.8;
     dst.drumPitch[id]     = src.drumPitch[id] ?? 0;
+    dst.drumFineTune[id]  = src.drumFineTune[id] ?? 0;
+    dst.drumReverse[id]   = src.drumReverse[id] ?? false;
+    dst.drumReverb[id]    = { ...(src.drumReverb[id] || { size: 0.3, damping: 0.5, mix: 0 }) };
+    dst.drumDelay[id]     = { ...(src.drumDelay[id] || { time: 250, feedback: 0.3, mix: 0 }) };
     dst.drumTrimStart[id] = src.drumTrimStart[id] ?? 0;
     dst.drumTrimEnd[id]   = src.drumTrimEnd[id] ?? 1;
     dst.drumEQ[id]        = { ...(src.drumEQ[id] || { low: 0, mid: 0, high: 0 }) };
@@ -196,10 +202,14 @@ function duplicateSlot(slotIndex) {
   dst.analyzeResults = JSON.parse(JSON.stringify(src.analyzeResults || {}));
   dst.lyricsTranscript = [...src.lyricsTranscript]; dst.transcriptLoaded = src.transcriptLoaded;
   dst.fileName = src.fileName;
+  dst.stemMode = src.stemMode;
   src.activePadIds.forEach(id => {
     const def = getPadDef(id); if (!def) return;
     _addPadToSlot(dst, def);
     dst.padText[id] = src.padText[id] || '';
+    if (typeof updateEQParams === 'function') updateEQParams(id, dst);
+    if (typeof updateReverbParams === 'function') updateReverbParams(id, dst);
+    if (typeof updateDelayParams === 'function') updateDelayParams(id, dst);
   });
   ensureAllPads(dst);
   slots.splice(slotIndex + 1, 0, dst);
@@ -244,6 +254,10 @@ function _addPadToSlot(slot, def) {
   padHeld[def.id]  = padHeld[def.id]  ?? false;
   slot.drumVolumes[def.id]    = slot.drumVolumes[def.id]    ?? 0.8;
   slot.drumPitch[def.id]      = slot.drumPitch[def.id]      ?? 0;
+  slot.drumFineTune[def.id]   = slot.drumFineTune[def.id]   ?? 0;
+  slot.drumReverse[def.id]    = slot.drumReverse[def.id]    ?? false;
+  slot.drumReverb[def.id]     = slot.drumReverb[def.id]     ?? { size: 0.3, damping: 0.5, mix: 0 };
+  slot.drumDelay[def.id]      = slot.drumDelay[def.id]      ?? { time: 250, feedback: 0.3, mix: 0 };
   slot.drumTrimStart[def.id]  = slot.drumTrimStart[def.id]  ?? 0;
   slot.drumTrimEnd[def.id]    = slot.drumTrimEnd[def.id]    ?? 1;
   slot.drumCandidates[def.id] = slot.drumCandidates[def.id] || [];
@@ -260,10 +274,12 @@ function _addPadToSlot(slot, def) {
     if (!m.cellPitch) m.cellPitch = {};
     m.cellPitch[def.id] = m.cellPitch[def.id] || new Array(slot.grid.steps).fill(0);
   });
-  if (!gainNodes[def.id]) {
+  const gKey = slot.uid + '_' + def.id;
+  if (!gainNodes[gKey]) {
     const node = audioCtx.createGain(); node.gain.value = 1.0;
-    node.connect(audioCtx.destination); gainNodes[def.id] = node;
+    node.connect(audioCtx.destination); gainNodes[gKey] = node;
   }
+  if (typeof _ensureEffectNodes === 'function') _ensureEffectNodes(gKey);
 }
 
 /** Ensure all 16 PAD_DEFS are active in a slot. Called after audioCtx is available.
@@ -285,9 +301,16 @@ function clearPad(id) {
   slot.padText[id] = '';
   slot.drumCandidates[id] = []; slot.drumIdx[id] = 0;
   slot.drumTrimStart[id] = 0; slot.drumTrimEnd[id] = 1;
+  slot.drumFineTune[id] = 0;
+  slot.drumReverse[id] = false;
+  slot.drumReverb[id] = { size: 0.3, damping: 0.5, mix: 0 };
+  slot.drumDelay[id] = { time: 250, feedback: 0.3, mix: 0 };
   slot.drumEQ[id] = { low: 0, mid: 0, high: 0 };
   slot.drumSpeed[id] = 1.0;
   slot.drumPitchSpeedLinked[id] = true;
+  if (typeof updateEQParams === 'function') updateEQParams(id, slot);
+  if (typeof updateReverbParams === 'function') updateReverbParams(id, slot);
+  if (typeof updateDelayParams === 'function') updateDelayParams(id, slot);
   invalidatePitchedCache(selectedSlotIdx, id);
   syncSharedInput(); positionSharedInput();
 }

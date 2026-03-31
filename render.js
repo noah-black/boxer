@@ -21,7 +21,7 @@ function getPadAreaLayout() {
   const seqRight = cW() - SEQ_MARGIN;
   const seqW = seqRight - seqLeft;
   const eqZoneW = 100;  // inline EQ graph width
-  const panelW = CTRL_PANEL_MIN_W + eqZoneW;
+  const panelW = CTRL_PANEL_MIN_W + FX_PANEL_EXTRA_W + eqZoneW;
 
   // Scale keys up 50% ideally, but shrink to fit available space
   const targetKW = Math.round(KEY_W * 1.5);
@@ -68,7 +68,7 @@ function keyXY(padIndex, layout) {
 }
 
 function slotRowHeight(slot, seqRowHeight) {
-  return slot.type === 'melody' ? Math.max(SEQ_ROW_H_MIN, Math.round(seqRowHeight * MELODY_ROW_SCALE)) : seqRowHeight;
+  return slot.type === 'melody' ? MELODY_ROW_MAX : seqRowHeight;
 }
 
 function totalSeqContentHeight(seqRowHeight) {
@@ -77,7 +77,7 @@ function totalSeqContentHeight(seqRowHeight) {
   return h + 96;
 }
 
-const MELODY_ROW_SCALE = 0.67; // melody rows are ~2/3 height of drum rows
+const MELODY_ROW_MAX = 10; // melody rows are fixed narrow height
 
 function getSeqLayout() {
   const L = getPadAreaLayout();
@@ -85,19 +85,19 @@ function getSeqLayout() {
   const seqW    = cW()-SEQ_MARGIN*2-SEQ_LABEL_W;
   const gridTop = seqTop+SEQ_CTRL_H;
   const available = cH()-gridTop-96; // reserve space for add-slot "+" below last slot
-  // Weight melody rows at MELODY_ROW_SCALE to compute equivalent row count
+  // Melody rows have fixed height, so subtract their space from available for drum row calculation
   const drumRows = slots.reduce((acc,s) => acc + (s.type !== 'melody' ? getSeqPads(s).length : 0), 0);
-  const melodyRows = slots.reduce((acc,s) => acc + (s.type === 'melody' ? getSeqPads(s).length : 0), 0);
-  const totalGridRows = drumRows + melodyRows * MELODY_ROW_SCALE;
+  const melodyPixels = slots.reduce((acc,s) => acc + (s.type === 'melody' ? getSeqPads(s).length * MELODY_ROW_MAX : 0), 0);
+  const totalGridRows = drumRows; // only drum rows are flexible
   const N = slots.length;
   const SLOT_HDR_MIN = 22;
   // First compute row height assuming header = row height
   const uniformH = constrain(floor((available - (N-1)*SLOT_GAP) / Math.max(1, totalGridRows + N)), SEQ_ROW_H_MIN, SEQ_ROW_H_MAX);
   // Header has its own minimum to accommodate slider controls
   SLOT_HDR_H = Math.max(uniformH, SLOT_HDR_MIN);
-  // Recompute row height with the actual header space subtracted
+  // Recompute row height with the actual header space and fixed melody pixels subtracted
   const headerTotal = N * SLOT_HDR_H + (N-1) * SLOT_GAP;
-  const seqRowHeight = constrain(floor((available - headerTotal) / Math.max(1, totalGridRows)), SEQ_ROW_H_MIN, SEQ_ROW_H_MAX);
+  const seqRowHeight = constrain(floor((available - headerTotal - melodyPixels) / Math.max(1, totalGridRows)), SEQ_ROW_H_MIN, SEQ_ROW_H_MAX);
   return { seqTop, seqW, seqRowHeight, ctrlY: seqTop, gridTop, gridLeft: SEQ_MARGIN+SEQ_LABEL_W };
 }
 
@@ -447,38 +447,50 @@ function drawMelodyKeyboard(L, slot) {
     const {x, y} = keyXY(i, L);
     const hov = mX()>x && mX()<x+kw && mY()>y && mY()<y+kh;
 
-    let noteId = null, flash = 9999, held = false;
+    let noteId = null, flashFrac = 0, held = false;
     if (mp.type !== 'unused') {
       const noteIdx = slot.melodyOctave * 12 + mp.semitone;
       noteId = 'm' + noteIdx;
-      flash = padFlash[noteId] ? (millis() - padFlash[noteId]) : 9999;
+      const flashTime = padFlash[noteId];
+      if (flashTime) {
+        const elapsed = millis() - flashTime;
+        const dur = _padFlashDur[noteId] || 150;
+        flashFrac = max(0, 1 - elapsed / dur);
+      }
       held = padHeld[noteId];
     }
 
     push();
     if (mp.type === 'unused') {
-      // Grayed out, non-interactive
       fill(...BG, 40);
       stroke(...INK_FAINT, 30); strokeWeight(0.5);
     } else if (mp.type === 'black') {
-      if (held || flash < 120) fill(210, 30, 60);
+      // Black keys flash white
+      if (held) fill(0, 0, 85);
+      else if (flashFrac > 0) fill(0, 0, lerp(20, 85, flashFrac));
       else if (hov) fill(210, 8, 30);
       else fill(210, 8, 20);
       stroke(...INK_FAINT); strokeWeight(0.5);
     } else {
-      // white
-      if (held || flash < 120) fill(210, 20, 95);
+      // White keys flash dark
+      if (held) fill(210, 10, 25);
+      else if (flashFrac > 0) fill(210, lerp(0, 10, flashFrac), lerp(100, 25, flashFrac));
       else if (hov) fill(0, 0, 98);
       else fill(0, 0, 100);
       stroke(...INK_FAINT); strokeWeight(0.5);
     }
     rect(x, y, kw, kh, 4);
 
-    // Key letter only
+    // Key letter — invert text color during flash
     noStroke();
     if (mp.type === 'unused') fill(...INK_FAINT, 30);
-    else if (mp.type === 'black') fill(0, 0, 55);
-    else fill(...INK_DIM);
+    else if (mp.type === 'black') {
+      if (held || flashFrac > 0.3) fill(210, 8, 20);
+      else fill(0, 0, 55);
+    } else {
+      if (held || flashFrac > 0.3) fill(0, 0, 85);
+      else fill(...INK_DIM);
+    }
     textSize(12); textAlign(CENTER, CENTER);
     text(mp.key, x+kw/2, y+kh/2);
     pop();
@@ -650,17 +662,19 @@ function drawControlPanel() {
   // Pitch slider
   drawPanelSlider(odef, C.sliderX, C.pitchSliderY, C.sliderW, 'pitch', slot.drumPitch[def.id]??0, -12, 12, hasCandidates, !isMapped);
 
+  // Fine tune slider
+  drawPanelSlider(odef, C.sliderX, C.fineSliderY, C.sliderW, 'fine', slot.drumFineTune[def.id]??0, -50, 50, hasCandidates, !isMapped);
+
   // Speed slider
-  const speedVal = linked ? Math.pow(2, (slot.drumPitch[def.id]??0)/12) : (slot.drumSpeed[def.id]??1.0);
+  const speedVal = linked ? Math.pow(2, ((slot.drumPitch[def.id]??0)+(slot.drumFineTune[def.id]??0)/100)/12) : (slot.drumSpeed[def.id]??1.0);
   drawPanelSlider(odef, C.sliderX, C.speedSliderY, C.sliderW, 'speed', speedVal, 0.5, 2.0, hasCandidates, !isMapped);
 
-  // Text input area + mode icons — first row spans full panel width (drum only)
-  if (slot.type === 'melody') {
-    // Inline EQ graph — always shown for melody
-    drawInlineEQ(odef, C, slot, def.id, !isMapped);
-    return;
-  }
-  const finalized = !!slot.padFinalized[def.id];
+  // Effects box (reverse toggle + reverb/delay knobs)
+  drawEffectsBox(odef, C, slot, def.id, !isMapped);
+
+  // Text input area + mode icons — first row spans full panel width
+  const isMelody = slot.type === 'melody';
+  const finalized = isMelody ? true : !!slot.padFinalized[def.id];
   const inputY = C.ctrlY;
   const inputH = C.inputRowH - 4;
   const hasTranscript = slot.transcriptLoaded && slot.lyricsTranscript.length > 0;
@@ -683,6 +697,15 @@ function drawControlPanel() {
   const unmappedPadAvailable = slot.activePadIds.some(pid => {
     return pid !== def.id && !slot.padMode[pid] && !(slot.drumCandidates[pid] && slot.drumCandidates[pid].length > 0);
   });
+
+  // For melody: draw label in textbox area on canvas (DOM input is hidden)
+  if (isMelody) {
+    const label = padText || slot.fileName || '';
+    fill(...SEQ_CELL); stroke(...INK_FAINT); strokeWeight(0.5);
+    rect(inputX, inputY, inputW, inputH, 3);
+    fill(...INK_DIM); noStroke(); textSize(6.5); textAlign(LEFT, CENTER);
+    text(truncateMiddle(label, inputW - 8), inputX + 4, inputY + inputH / 2);
+  }
 
   // Draw icons left to right, right-aligned
   let iconCurX = iconsLeftEdge;
@@ -781,7 +804,7 @@ function drawControlPanel() {
   // Duplicate icon — two overlapping rectangles with + — grayed when no unmapped pad or not mapped
   {
     const cx = iconCurX + iconW / 2;
-    const enabled = isMapped && unmappedPadAvailable;
+    const enabled = !isMelody && isMapped && unmappedPadAvailable;
     const dHov = enabled && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2;
     const col = dHov ? ACCENT : (enabled ? INK_FAINT : [...INK_FAINT, 30]);
     push(); translate(cx, iconCy);
@@ -805,7 +828,7 @@ function drawControlPanel() {
   // Trash icon — grayed when pad is unmapped
   {
     const cx = iconCurX + iconW / 2;
-    const enabled = isMapped;
+    const enabled = !isMelody && isMapped;
     const tHov = enabled && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2;
     const col = tHov ? ACCENT : (enabled ? INK_FAINT : [...INK_FAINT, 30]);
     push(); translate(cx, iconCy);
@@ -833,8 +856,8 @@ function drawControlPanel() {
     iconCurX += iconW;
   }
 
-  // X inside the text input (right edge) when finalized — clears text
-  if (finalized && padText) {
+  // X inside the text input (right edge) when finalized — clears text (not shown for melody)
+  if (!isMelody && finalized && padText) {
     const xX = inputX + inputW - 10;
     const xY = inputY + inputH/2;
     const xHov = dist(mX(), mY(), xX, xY) < 7;
@@ -959,6 +982,115 @@ function drawInlineEQ(drum, C, slot, padId, dimmed) {
   }
 }
 
+/** Draw a compact rotary knob. Returns {cx, cy, r} for hit testing. */
+function drawCompactKnob(cx, cy, radius, value, vmin, vmax, label, color, dimmed) {
+  const norm = constrain((value - vmin) / (vmax - vmin), 0, 1);
+  const startAngle = PI * 0.75;   // 225° (7 o'clock)
+  const sweep = PI * 1.5;         // 270° range
+  const endAngle = startAngle + sweep;
+  const valAngle = startAngle + norm * sweep;
+
+  // Background circle
+  fill(dimmed ? [...SEQ_CELL, 60] : SEQ_CELL); stroke(dimmed ? [...INK_FAINT, 20] : INK_FAINT); strokeWeight(0.5);
+  circle(cx, cy, radius * 2);
+
+  // Track arc (full range, faint)
+  noFill(); stroke(dimmed ? [...INK_FAINT, 15] : [...INK_FAINT, 30]); strokeWeight(1.5);
+  arc(cx, cy, radius * 1.6, radius * 1.6, startAngle, endAngle);
+
+  // Value arc (colored)
+  if (!dimmed) {
+    stroke(color[0], color.length > 2 ? color[1] : DRUM_S, color.length > 2 ? color[2] : DRUM_B);
+    strokeWeight(1.5);
+    if (norm > 0.01) arc(cx, cy, radius * 1.6, radius * 1.6, startAngle, valAngle);
+  }
+
+  // Tick mark at current position
+  const tickR1 = radius * 0.5, tickR2 = radius * 0.9;
+  const tx1 = cx + cos(valAngle) * tickR1, ty1 = cy + sin(valAngle) * tickR1;
+  const tx2 = cx + cos(valAngle) * tickR2, ty2 = cy + sin(valAngle) * tickR2;
+  stroke(dimmed ? [...INK_FAINT, 30] : INK); strokeWeight(0.8);
+  line(tx1, ty1, tx2, ty2);
+
+  // Label below
+  fill(dimmed ? [...INK_FAINT, 25] : INK_DIM); noStroke();
+  textSize(4); textAlign(CENTER, TOP);
+  text(label, cx, cy + radius + 1);
+
+  // Hover
+  const hov = !dimmed && dist(mX(), mY(), cx, cy) < radius + 2;
+  if (hov) cursor(HAND);
+  return { cx, cy, r: radius, hov };
+}
+
+/** Get layout positions for the 6 effect knobs + reverse toggle within the effects box. */
+function fxBoxLayout(C) {
+  const bx = C.fxBoxX, by = C.fxBoxY, bw = C.fxBoxW, bh = C.fxBoxH;
+  const revW = 22, revH = 12;
+  const revX = bx + 4, revY = by + 4;
+  // Knob area starts right of reverse toggle
+  const knobAreaX = bx + revW + 10;
+  const knobAreaW = bw - revW - 14;
+  const knobR = 7;  // knob radius
+  const knobSpacing = knobAreaW / 3;
+  const rowY1 = by + 14;  // reverb row center
+  const rowY2 = by + bh - 14;  // delay row center
+  const knobs = {};
+  // Reverb knobs
+  knobs.reverbSize = { cx: knobAreaX + knobSpacing * 0.5, cy: rowY1 };
+  knobs.reverbDamping = { cx: knobAreaX + knobSpacing * 1.5, cy: rowY1 };
+  knobs.reverbMix = { cx: knobAreaX + knobSpacing * 2.5, cy: rowY1 };
+  // Delay knobs
+  knobs.delayTime = { cx: knobAreaX + knobSpacing * 0.5, cy: rowY2 };
+  knobs.delayFeedback = { cx: knobAreaX + knobSpacing * 1.5, cy: rowY2 };
+  knobs.delayMix = { cx: knobAreaX + knobSpacing * 2.5, cy: rowY2 };
+  return { revX, revY, revW, revH, knobs, knobR };
+}
+
+/** Draw the effects box: reverse toggle + reverb/delay knobs. */
+function drawEffectsBox(drum, C, slot, padId, dimmed) {
+  const bx = C.fxBoxX, by = C.fxBoxY, bw = C.fxBoxW, bh = C.fxBoxH;
+  // Box background
+  fill(...SEQ_CELL); stroke(...(dimmed ? [...INK_FAINT, 40] : INK_FAINT)); strokeWeight(0.5);
+  rect(bx, by, bw, bh, 4);
+
+  const fx = fxBoxLayout(C);
+  const rev = slot.drumReverse[padId] ?? false;
+  const rvb = slot.drumReverb[padId] || { size: 0.3, damping: 0.5, mix: 0 };
+  const dly = slot.drumDelay[padId] || { time: 250, feedback: 0.3, mix: 0 };
+  const col = [drum.hue, DRUM_S, DRUM_B];
+
+  // Reverse toggle
+  const revHov = !dimmed && mX() > fx.revX && mX() < fx.revX + fx.revW && mY() > fx.revY && mY() < fx.revY + fx.revH;
+  if (rev) {
+    fill(drum.hue, dimmed ? 15 : DRUM_S_LITE, dimmed ? 85 : DRUM_B_LITE);
+  } else {
+    fill(dimmed ? [...SEQ_CELL, 60] : SEQ_CELL);
+  }
+  stroke(revHov ? ACCENT : (dimmed ? [...INK_FAINT, 20] : INK_FAINT)); strokeWeight(0.5);
+  rect(fx.revX, fx.revY, fx.revW, fx.revH, 3);
+  fill(rev ? (dimmed ? [...INK_FAINT, 30] : INK) : (dimmed ? [...INK_FAINT, 25] : INK_DIM));
+  noStroke(); textSize(4.5); textAlign(CENTER, CENTER);
+  text('REV', fx.revX + fx.revW / 2, fx.revY + fx.revH / 2);
+  if (revHov) cursor(HAND);
+
+  // Section labels
+  fill(dimmed ? [...INK_FAINT, 20] : INK_FAINT); noStroke(); textSize(3.5); textAlign(LEFT, TOP);
+  const labelX = fx.knobs.reverbSize.cx - fx.knobR;
+  text('REVERB', labelX, by + 2);
+  text('DELAY', labelX, by + bh / 2 + 1);
+
+  // Reverb knobs
+  drawCompactKnob(fx.knobs.reverbSize.cx, fx.knobs.reverbSize.cy, fx.knobR, rvb.size, 0, 1, 'SIZE', col, dimmed);
+  drawCompactKnob(fx.knobs.reverbDamping.cx, fx.knobs.reverbDamping.cy, fx.knobR, rvb.damping, 0, 1, 'DAMP', col, dimmed);
+  drawCompactKnob(fx.knobs.reverbMix.cx, fx.knobs.reverbMix.cy, fx.knobR, rvb.mix, 0, 1, 'MIX', col, dimmed);
+
+  // Delay knobs
+  drawCompactKnob(fx.knobs.delayTime.cx, fx.knobs.delayTime.cy, fx.knobR, dly.time, 10, 1000, 'TIME', col, dimmed);
+  drawCompactKnob(fx.knobs.delayFeedback.cx, fx.knobs.delayFeedback.cy, fx.knobR, dly.feedback, 0, 0.95, 'FB', col, dimmed);
+  drawCompactKnob(fx.knobs.delayMix.cx, fx.knobs.delayMix.cy, fx.knobR, dly.mix, 0, 1, 'MIX', col, dimmed);
+}
+
 /** Compute consistent control positions within the panel. Used by render + input. */
 function panelControlLayout(L) {
   const inputRowH = 24;  // height reserved for text input + icons row
@@ -970,33 +1102,42 @@ function panelControlLayout(L) {
   const rowX = L.panelX + 8;
   const rowW = L.panelW - 16;
 
-  // Slider box — left portion below the text row
+  // Slider box — left portion below the text row (narrowed to 3/4)
   const sliderBoxPad = 4;
   const sliderBoxX = L.panelX + 8;
-  const sliderBoxW = CTRL_PANEL_MIN_W - 16;
-  const labelPadL = 35;   // space for labels (VOL, PITCH, SPEED) — includes chain bracket zone
-  const labelPadR = 24;   // space for values on right
+  const sliderBoxW = Math.round((CTRL_PANEL_MIN_W - 16) * SLIDER_BOX_SCALE);  // 108px
+  const labelPadL = 28;   // space for labels (VOL, PITCH, FINE, SPEED) — includes chain bracket zone
+  const labelPadR = 18;   // space for values on right
   const sliderW = sliderBoxW - sliderBoxPad * 2 - labelPadL - labelPadR;
-  // Three stacked horizontal sliders: VOL, PITCH, SPEED
-  const sliderRowH = 16;   // vertical space per slider row
-  const sliderBoxH = sliderRowH * 3 + sliderBoxPad * 2;
+  // Four stacked horizontal sliders: VOL, PITCH, FINE, SPEED
+  const sliderRowH = 13;   // vertical space per slider row (tighter to fit 4)
+  const sliderBoxH = sliderRowH * 4 + sliderBoxPad * 2;
   const sliderBoxY = dividerY + 4;  // below divider
   const volSliderY = sliderBoxY + sliderBoxPad + sliderRowH / 2;
   const pitchSliderY = volSliderY + sliderRowH;
-  const speedSliderY = pitchSliderY + sliderRowH;
+  const fineSliderY = pitchSliderY + sliderRowH;
+  const speedSliderY = fineSliderY + sliderRowH;
   const chainY = (pitchSliderY + speedSliderY) / 2;
   const sliderX = sliderBoxX + sliderBoxPad + labelPadL;
   const chainX = sliderBoxX + sliderBoxPad;  // chain icon near left edge of label zone
 
-  // Inline EQ graph — right of sliders, same height as slider box
+  // Effects box — right of slider box, left of EQ graph
+  const fxBoxGap = 4;
+  const fxBoxX = sliderBoxX + sliderBoxW + fxBoxGap;
+  const fxBoxW = L.panelX + CTRL_PANEL_MIN_W + FX_PANEL_EXTRA_W - fxBoxX - 4;
+  const fxBoxY = sliderBoxY;
+  const fxBoxH = sliderBoxH;
+
+  // Inline EQ graph — right of effects box, same height as slider box
   const eqPad = 8;
-  const eqGraphX = L.panelX + CTRL_PANEL_MIN_W + eqPad;
+  const eqGraphX = L.panelX + CTRL_PANEL_MIN_W + FX_PANEL_EXTRA_W + eqPad;
   const eqGraphY = sliderBoxY;
-  const eqGraphW = L.panelW - CTRL_PANEL_MIN_W - eqPad * 2;
+  const eqGraphW = L.panelW - (CTRL_PANEL_MIN_W + FX_PANEL_EXTRA_W) - eqPad * 2;
   const eqGraphH = sliderBoxH;
   return { ctrlY, ctrlH, dividerY, inputRowH, sliderW, sliderX,
-    volSliderY, pitchSliderY, speedSliderY, chainX, chainY,
+    volSliderY, pitchSliderY, fineSliderY, speedSliderY, chainX, chainY,
     sliderBoxX, sliderBoxY, sliderBoxW, sliderBoxH, rowX, rowW,
+    fxBoxX, fxBoxY, fxBoxW, fxBoxH,
     eqGraphX, eqGraphY, eqGraphW, eqGraphH };
 }
 
@@ -1015,7 +1156,7 @@ function drawPanelSlider(drum, x, y, w, param, val, vmin, vmax, hasCandidates, d
   // Fill
   if (hasCandidates) {
     stroke(drum.hue, hov?50:(dimmed?20:DRUM_S), hov?70:(dimmed?80:DRUM_B)); strokeWeight(2);
-    if (param === 'pitch' || param === 'speed') {
+    if (param === 'pitch' || param === 'fine' || param === 'speed') {
       const midX = x + w/2;
       if (handleX >= midX) line(midX, y, handleX, y);
       else line(handleX, y, midX, y);
@@ -1031,7 +1172,7 @@ function drawPanelSlider(drum, x, y, w, param, val, vmin, vmax, hasCandidates, d
   // Label left
   fill(dimmed ? [...INK_FAINT, 30] : (hasCandidates ? INK_DIM : INK_FAINT)); noStroke();
   textSize(6); textAlign(RIGHT, CENTER);
-  const labels = { vol: 'VOL', pitch: 'PITCH', speed: 'SPEED' };
+  const labels = { vol: 'VOL', pitch: 'PITCH', fine: 'FINE', speed: 'SPEED' };
   text(labels[param] || param, x - 6, y);
 
   // Value right
@@ -1039,27 +1180,27 @@ function drawPanelSlider(drum, x, y, w, param, val, vmin, vmax, hasCandidates, d
   if (dimmed) fill([...INK_FAINT, 30]);
   if (param==='vol') text(Math.round(val*100)+'%', x+w+4, y);
   else if (param==='pitch') text((val>0?'+':'')+val, x+w+4, y);
+  else if (param==='fine') text((val>0?'+':'')+Math.round(val)+'¢', x+w+4, y);
   else text(Math.round(val*100)+'%', x+w+4, y);
 
   if (hov) cursor(HAND);
 }
 
 function drawChainLinkWithLines(cx, cy, pitchY, speedY, bracketRight, linked, drum, dimmed) {
-  const hov = !dimmed && abs(mX()-cx)<6 && abs(mY()-cy)<6;
+  const hov = !dimmed && abs(mX()-cx)<5 && abs(mY()-cy)<5;
   const col = dimmed ? [...INK_FAINT, 20] : (linked ? [drum.hue, DRUM_S, DRUM_B] : [...INK_FAINT, 40]);
 
   // Rectilinear connector lines from chain icon to pitch/speed label areas
   const lineCol = dimmed ? [...INK_FAINT, 15] : (linked ? [drum.hue, 20, DRUM_B] : [...INK_FAINT, 25]);
   stroke(lineCol); strokeWeight(0.7); noFill();
   // Top connector: up from chain to pitch row, then right
-  line(cx, cy - 3.5, cx, pitchY); line(cx, pitchY, bracketRight, pitchY);
+  line(cx, cy - 4, cx, pitchY); line(cx, pitchY, bracketRight, pitchY);
   // Bottom connector: down from chain to speed row, then right
-  line(cx, cy + 3.5, cx, speedY); line(cx, speedY, bracketRight, speedY);
+  line(cx, cy + 4, cx, speedY); line(cx, speedY, bracketRight, speedY);
 
-  // Chain link icon — rotated 90° (vertical) and scaled 50% from the original
-  // Rotated 90°: swap w/h → each link is 2 wide × 3.5 tall
-  const lkW = 2, lkH = 3.5, r = 0.75, sw = 0.8;
-  const overlap = 1.25;
+  // Chain link icon — rotated 90° (vertical), scaled down to fit tighter spacing
+  const lkW = 1.6, lkH = 2.8, r = 0.6, sw = 0.7;
+  const overlap = 1.0;
 
   // p5's scale(UI_SCALE) is already active, so use logical coords directly
   const dc = drawingContext;
@@ -2004,6 +2145,29 @@ function drawTrimOverlay() {
   const canHov=mX()>canX&&mX()<canX+canW&&mY()>btnY&&mY()<btnY+btnH;
   fill(canHov?RED:PANEL); stroke(...INK); strokeWeight(1); rect(canX,btnY,canW,btnH,CORNER_RADIUS);
   fill(canHov?[0,0,98]:INK); noStroke(); textSize(8); textAlign(CENTER,CENTER); text('CANCEL',canX+canW/2,btnY+btnH/2);
+
+  // Stem isolation toggle (between CANCEL and PLAY)
+  if (!isCustomClip) {
+    const stemLabels = ['FULL', 'VOX', 'DRUMS'];
+    const stemValues = ['full', 'vocals', 'drums'];
+    const playBtnLeft = cW()/2-32;
+    const gap = playBtnLeft - (canX+canW);
+    const capsW = Math.min(gap - 16, 150);
+    const capsX = canX + canW + (gap - capsW) / 2;
+    const cellW = capsW / 3;
+    for (let i = 0; i < 3; i++) {
+      const cx = capsX + i * cellW;
+      const sel = trimStemMode === stemValues[i];
+      const hov = mX()>cx&&mX()<cx+cellW&&mY()>btnY&&mY()<btnY+btnH;
+      const rTL = i===0 ? CORNER_RADIUS : 0, rTR = i===2 ? CORNER_RADIUS : 0;
+      const rBR = i===2 ? CORNER_RADIUS : 0, rBL = i===0 ? CORNER_RADIUS : 0;
+      fill(sel ? ACCENT : (hov ? [...INK_FAINT] : PANEL));
+      stroke(...INK); strokeWeight(1);
+      rect(cx, btnY, cellW, btnH, rTL, rTR, rBR, rBL);
+      fill(sel ? [0,0,98] : INK); noStroke(); textSize(7); textAlign(CENTER,CENTER);
+      text(stemLabels[i], cx+cellW/2, btnY+btnH/2);
+    }
+  }
 
   const isPlayingPreview = !!trimPlaySrc;
   const playBtnW=64, playBtnX=cW()/2-playBtnW/2;

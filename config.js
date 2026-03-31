@@ -71,7 +71,7 @@ const INK_DIM   = [210,  5,  0];
 const INK_FAINT = [210,  3,  0];
 const ACCENT    = [205, 45, 75];
 const RED       = [0,  55,  65];
-const MELODY_CELL = [210, 25, 70];
+const MELODY_CELL = [210, 45, 50];
 const SELECTED_HDR = [206,  8, 100];
 let DRUM_S = 75, DRUM_B = 53;
 let DRUM_S_LITE = 35, DRUM_B_LITE = 90;
@@ -105,6 +105,8 @@ const KEY_H           = 28;
 const KEY_GAP         = 3;
 const KEY_ROW2_OFFSET = 15;
 const CTRL_PANEL_MIN_W = 160;
+const FX_PANEL_EXTRA_W = 70;   // panel widens to fit effects box
+const SLIDER_BOX_SCALE = 0.75; // slider box narrows to 3/4 width
 const CTRL_PANEL_GAP  = 12;  // gap between key grid and control panel
 const SEQ_ROW_H_MIN = 13;
 const SEQ_ROW_H_MAX = 28;
@@ -119,7 +121,7 @@ let SEQ_MARGIN      = 56;
 const SEQ_LABEL_W   = 68;
 const VOL_TAB_W     = 36;
 const CORNER_RADIUS = 5;
-const MIN_WIDTH     = 775;
+const MIN_WIDTH     = 845;
 
 // ── Trimmer ──────────────────────────────────────────────────────────────────
 const TRIM_MAX_SECS = 30;
@@ -176,15 +178,18 @@ function truncateMiddle(str, maxWidth) {
 /** Create a new slot data structure. Starts with no active pads.
  *  @param {string} type - 'drum' (default) or 'melody' */
 let _nextHueOffset = 0;
+let _nextSlotUid = 1;
 function createSlot(type) {
   type = type || 'drum';
   const offset = _nextHueOffset;
   _nextHueOffset = (_nextHueOffset + 137) % 360; // golden-angle step for variety
   const slot = {
+    uid: _nextSlotUid++,
     type: type,
-    drumCandidates: {}, drumIdx: {}, drumVolumes: {}, drumPitch: {},
+    drumCandidates: {}, drumIdx: {}, drumVolumes: {}, drumPitch: {}, drumFineTune: {},
     drumTrimStart: {}, drumTrimEnd: {}, drumEQ: {},
     drumSpeed: {}, drumPitchSpeedLinked: {},
+    drumReverse: {}, drumReverb: {}, drumDelay: {},
     activePadIds: [],
     padText: {}, padFinalized: {}, padMode: {}, padMenuOpen: {},
     sessionId: null, sourceBuffer: null, analyzeResults: {},
@@ -192,7 +197,7 @@ function createSlot(type) {
     grid: { steps: 16, measures: [{ cells: {}, cellPitch: {} }], editMeasure: 0 }, gridVolume: 1.0, swing: 0, humanize: 0, muted: false, soloed: false,
     humanizeSeeds: makeHumanizeSeeds(),
     hueOffset: offset,
-    fileName: null,
+    fileName: null, stemMode: null,
   };
   if (type === 'melody') {
     slot.melodyOctave = 2;            // base octave (unshifted)

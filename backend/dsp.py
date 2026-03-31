@@ -47,6 +47,13 @@ def load_audio(data: bytes) -> np.ndarray:
     return audio
 
 
+def numpy_to_wav_bytes(audio: np.ndarray, sr: int = SAMPLE_RATE) -> bytes:
+    """Encode a numpy audio array as raw WAV bytes."""
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, format="WAV", subtype="FLOAT")
+    return buf.getvalue()
+
+
 def clip_to_base64_wav(clip: np.ndarray) -> str:
     """Encode a numpy audio clip as a base64-encoded WAV string."""
     buf = io.BytesIO()

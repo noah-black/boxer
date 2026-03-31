@@ -168,6 +168,10 @@ function scheduleLoop() {
                 else clipDurSec = ((cand.ctxEnd || 1) - (cand.ctxStart || 0)) * (glowTe - glowTs);
                 const delayMs = Math.max(0, (time - audioCtx.currentTime)) * 1000;
                 _cellGlow[glowSi + '_' + noteId + '_' + stepInMeasure] = { triggerMs: millis() + delayMs, durationMs: clipDurSec * 1000 };
+                // Flash the keyboard pad for this note
+                if (slotIndex === selectedSlotIdx) {
+                  setTimeout(() => { padFlash[noteId] = millis(); _padFlashDur[noteId] = clipDurSec * 1000; }, delayMs);
+                }
               }
             }
           });
@@ -186,6 +190,190 @@ function scheduleLoop() {
     }
   });
   scheduleTimer=setTimeout(scheduleLoop,LOOKAHEAD_MS);
+}
+
+// ── Per-pad effect nodes ─────────────────────────────────────────────────────
+
+let effectNodes = {};
+
+function generateIR(size, damping) {
+  const duration = 0.1 + size * 4.9;
+  const sr = audioCtx.sampleRate;
+  const len = Math.floor(sr * duration);
+  const buf = audioCtx.createBuffer(2, len, sr);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = buf.getChannelData(ch);
+    let lp = 0;
+    const coeff = 1 - damping * 0.7;
+    for (let i = 0; i < len; i++) {
+      const noise = Math.random() * 2 - 1;
+      const env = Math.pow(1 - i / len, 2);
+      lp = lp * (1 - coeff) + noise * coeff;
+      data[i] = lp * env;
+    }
+  }
+  return buf;
+}
+
+function _ensureEffectNodes(gKey) {
+  if (effectNodes[gKey] || !audioCtx || !gainNodes[gKey]) return;
+  const gn = gainNodes[gKey];
+  gn.disconnect();
+
+  // Reverb routing — gain nodes always present, convolver created lazily when mix > 0
+  const reverbDry = audioCtx.createGain(); reverbDry.gain.value = 1.0;
+  const reverbWet = audioCtx.createGain(); reverbWet.gain.value = 0.0;
+  const reverbOut = audioCtx.createGain(); reverbOut.gain.value = 1.0;
+  gn.connect(reverbDry); reverbDry.connect(reverbOut);
+  reverbWet.connect(reverbOut); // silent until convolver feeds it
+
+  // Delay routing — gain nodes always present, delayNode created lazily when mix > 0
+  const delayDry = audioCtx.createGain(); delayDry.gain.value = 1.0;
+  const delayWet = audioCtx.createGain(); delayWet.gain.value = 0.0;
+  const delayOut = audioCtx.createGain(); delayOut.gain.value = 1.0;
+  reverbOut.connect(delayDry); delayDry.connect(delayOut);
+  delayWet.connect(delayOut); // silent until delayNode feeds it
+
+  delayOut.connect(audioCtx.destination);
+
+  // EQ and reverb/delay processing nodes all created lazily.
+  // preReverbInput tracks the node feeding reverbDry (and convolver when active):
+  // either gainNodes[gKey] (no EQ) or eqHi (EQ active).
+  effectNodes[gKey] = {
+    eqLo: null, eqMd: null, eqHi: null,
+    reverbDry, reverbWet, reverbOut,
+    delayDry, delayWet, delayOut,
+    convolver: null, delayNode: null, delayFeedback: null,
+    preReverbInput: gn
+  };
+}
+
+/** Lazily create or destroy EQ BiquadFilters based on whether any band is non-zero. */
+function updateEQParams(padId, slot) {
+  slot = slot || currentSlot();
+  const gKey = slot.uid + '_' + padId;
+  const fx = effectNodes[gKey]; if (!fx) return;
+  const gn = gainNodes[gKey];
+  const eq = slot.drumEQ[padId] || { low: 0, mid: 0, high: 0 };
+  const needsEQ = eq.low !== 0 || eq.mid !== 0 || eq.high !== 0;
+
+  if (needsEQ) {
+    if (!fx.eqLo) {
+      // Create and splice EQ into the chain: gn → eqLo → eqMd → eqHi → reverbDry (+ convolver)
+      fx.eqLo = audioCtx.createBiquadFilter(); fx.eqLo.type = 'lowshelf'; fx.eqLo.frequency.value = EQ_LOW_FREQ;
+      fx.eqMd = audioCtx.createBiquadFilter(); fx.eqMd.type = 'peaking'; fx.eqMd.frequency.value = EQ_MID_FREQ; fx.eqMd.Q.value = EQ_MID_Q;
+      fx.eqHi = audioCtx.createBiquadFilter(); fx.eqHi.type = 'highshelf'; fx.eqHi.frequency.value = EQ_HIGH_FREQ;
+      fx.eqLo.connect(fx.eqMd); fx.eqMd.connect(fx.eqHi);
+      // Disconnect gn from reverb path, insert EQ
+      try { gn.disconnect(fx.reverbDry); } catch(e) {}
+      if (fx.convolver) try { gn.disconnect(fx.convolver); } catch(e) {}
+      gn.connect(fx.eqLo);
+      fx.eqHi.connect(fx.reverbDry);
+      if (fx.convolver) fx.eqHi.connect(fx.convolver);
+      fx.preReverbInput = fx.eqHi;
+    }
+    fx.eqLo.gain.value = eq.low;
+    fx.eqMd.gain.value = eq.mid;
+    fx.eqHi.gain.value = eq.high;
+  } else if (fx.eqLo) {
+    // Remove EQ from chain: gn → reverbDry (+ convolver) directly
+    try { gn.disconnect(fx.eqLo); } catch(e) {}
+    try { fx.eqHi.disconnect(fx.reverbDry); } catch(e) {}
+    if (fx.convolver) try { fx.eqHi.disconnect(fx.convolver); } catch(e) {}
+    fx.eqLo.disconnect(); fx.eqMd.disconnect(); fx.eqHi.disconnect();
+    fx.eqLo = null; fx.eqMd = null; fx.eqHi = null;
+    gn.connect(fx.reverbDry);
+    if (fx.convolver) gn.connect(fx.convolver);
+    fx.preReverbInput = gn;
+  }
+}
+
+/** Create or destroy the convolver as needed, update all reverb params. */
+function updateReverbParams(padId, slot) {
+  slot = slot || currentSlot();
+  const gKey = slot.uid + '_' + padId;
+  const fx = effectNodes[gKey]; if (!fx) return;
+  const r = slot.drumReverb[padId] || { size: 0.3, damping: 0.5, mix: 0 };
+  fx.reverbWet.gain.value = r.mix;
+  fx.reverbDry.gain.value = 1 - r.mix;
+  if (r.mix > 0) {
+    if (!fx.convolver) {
+      fx.convolver = audioCtx.createConvolver();
+      fx.preReverbInput.connect(fx.convolver);
+      fx.convolver.connect(fx.reverbWet);
+    }
+    fx.convolver.buffer = generateIR(r.size, r.damping);
+  } else if (fx.convolver) {
+    try { fx.convolver.disconnect(); } catch(e) {}
+    try { fx.preReverbInput.disconnect(fx.convolver); } catch(e) {}
+    fx.convolver = null;
+  }
+}
+
+/** Update reverb wet/dry mix only (cheap, safe during knob drag). */
+function updateReverbMix(padId, slot) {
+  slot = slot || currentSlot();
+  const gKey = slot.uid + '_' + padId;
+  const fx = effectNodes[gKey]; if (!fx) return;
+  const r = slot.drumReverb[padId] || { size: 0.3, damping: 0.5, mix: 0 };
+  fx.reverbWet.gain.value = r.mix;
+  fx.reverbDry.gain.value = 1 - r.mix;
+  // Lazily create convolver when mix first goes above 0
+  if (r.mix > 0 && !fx.convolver) {
+    fx.convolver = audioCtx.createConvolver();
+    fx.convolver.buffer = generateIR(r.size, r.damping);
+    fx.preReverbInput.connect(fx.convolver);
+    fx.convolver.connect(fx.reverbWet);
+  }
+}
+
+/** Create or destroy the delay node as needed, update all delay params. */
+function updateDelayParams(padId, slot) {
+  slot = slot || currentSlot();
+  const gKey = slot.uid + '_' + padId;
+  const fx = effectNodes[gKey]; if (!fx) return;
+  const d = slot.drumDelay[padId] || { time: 250, feedback: 0.3, mix: 0 };
+  fx.delayWet.gain.value = d.mix;
+  fx.delayDry.gain.value = 1 - d.mix;
+  if (d.mix > 0) {
+    if (!fx.delayNode) {
+      fx.delayNode = audioCtx.createDelay(2.0);
+      fx.delayFeedback = audioCtx.createGain();
+      fx.reverbOut.connect(fx.delayNode);
+      fx.delayNode.connect(fx.delayFeedback);
+      fx.delayFeedback.connect(fx.delayNode);
+      fx.delayNode.connect(fx.delayWet);
+    }
+    fx.delayNode.delayTime.value = d.time / 1000;
+    fx.delayFeedback.gain.value = d.feedback;
+  } else if (fx.delayNode) {
+    try { fx.delayNode.disconnect(); } catch(e) {}
+    try { fx.delayFeedback.disconnect(); } catch(e) {}
+    try { fx.reverbOut.disconnect(fx.delayNode); } catch(e) {}
+    fx.delayNode = null; fx.delayFeedback = null;
+  }
+}
+
+/** Reverse an AudioBuffer's channel data in place. */
+function reverseBuffer(buf) {
+  for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+    const data = buf.getChannelData(ch);
+    data.reverse();
+  }
+  return buf;
+}
+
+/** Extract a segment of an AudioBuffer into a new buffer. */
+function extractSegment(buf, startSec, durSec) {
+  const sr = buf.sampleRate;
+  const startSamp = Math.floor(startSec * sr);
+  const numSamp = Math.min(Math.floor(durSec * sr), buf.length - startSamp);
+  if (numSamp < 1) return audioCtx.createBuffer(buf.numberOfChannels, 1, sr);
+  const out = audioCtx.createBuffer(buf.numberOfChannels, numSamp, sr);
+  for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+    out.getChannelData(ch).set(buf.getChannelData(ch).subarray(startSamp, startSamp + numSamp));
+  }
+  return out;
 }
 
 // ── Drum playback ────────────────────────────────────────────────────────────
@@ -247,8 +435,9 @@ function renderPitchedBuffer(inputBuffer, semitones, speed) {
   let written = 0;
   for (const c of chunks) {
     for (let i = 0; i < c.frames && written < actualLen; i++) {
-      outL[written] = c.data[i * 2];
-      if (outR) outR[written] = c.data[i * 2 + 1];
+      const l = c.data[i * 2], r = c.data[i * 2 + 1];
+      outL[written] = isFinite(l) ? l : 0;
+      if (outR) outR[written] = isFinite(r) ? r : 0;
       written++;
     }
   }
@@ -309,7 +498,8 @@ function extractCandidateBuffer(slot, cand) {
 function playCandidate(slot, id, cand, when, volScale=1.0, cellPitch=0) {
   const src=audioCtx.createBufferSource();
   const baseSemitones = slot.drumPitch[id] ?? 0;
-  const semitones = baseSemitones + cellPitch;
+  const fineTune = (slot.drumFineTune[id] ?? 0) / 100;  // cents → semitones
+  const semitones = baseSemitones + fineTune + cellPitch;
   const linked = slot.drumPitchSpeedLinked[id] ?? true;
   // Force WSOLA (speed-locked) when cellPitch is non-zero
   const forceWSola = cellPitch !== 0;
@@ -327,28 +517,20 @@ function playCandidate(slot, id, cand, when, volScale=1.0, cellPitch=0) {
   if (drag&&(drag.type==='trimStart'||drag.type==='trimEnd')&&drag.id===id&&(drag.slotIdx??-1)===si) {
     ts=drag.proposedStart??ts; te=drag.proposedEnd??te;
   }
-  let dest=gainNodes[id];
-  // EQ filter chain — skip when all gains are zero to avoid BiquadFilter instability
-  // on short/high-pitched WSOLA buffers
-  const eq = slot.drumEQ[id] || { low: 0, mid: 0, high: 0 };
-  const hasEQ = eq.low !== 0 || eq.mid !== 0 || eq.high !== 0;
-  let eqLo=null, eqMd=null, eqHi=null;
-  if (hasEQ) {
-    eqLo=audioCtx.createBiquadFilter(); eqLo.type='lowshelf'; eqLo.frequency.value=EQ_LOW_FREQ; eqLo.gain.value=eq.low;
-    eqMd=audioCtx.createBiquadFilter(); eqMd.type='peaking'; eqMd.frequency.value=EQ_MID_FREQ; eqMd.Q.value=EQ_MID_Q; eqMd.gain.value=eq.mid;
-    eqHi=audioCtx.createBiquadFilter(); eqHi.type='highshelf'; eqHi.frequency.value=EQ_HIGH_FREQ; eqHi.gain.value=eq.high;
-    eqLo.connect(eqMd); eqMd.connect(eqHi); eqHi.connect(dest); dest=eqLo;
-  }
+  const gKey = slot.uid + '_' + id;
+  let dest=gainNodes[gKey];
+  // EQ is handled by persistent nodes in the effect chain (updated via updateEQParams)
   // Volume gain — always created so we can live-update
   const volGain=audioCtx.createGain(); volGain.gain.value=effectiveVol; volGain.connect(dest); dest=volGain;
 
+  const isReversed = !!(slot.drumReverse[id]);
+
   if (needWSola) {
-    // Extract just the trimmed region (+ small margin) for WSOLA processing,
-    // not the full context window which could be the entire source file.
-    const cacheKey = pitchedCacheKey(si, id, semitones, speed) + '_' + ts.toFixed(6) + '_' + te.toFixed(6);
+    // Extract just the trimmed region for WSOLA processing
+    const revTag = isReversed ? '_R' : '';
+    const cacheKey = pitchedCacheKey(si, id, semitones, speed) + '_' + ts.toFixed(6) + '_' + te.toFixed(6) + revTag;
     let pitchedBuf = _pitchedBufferCache[cacheKey];
     if (!pitchedBuf) {
-      // Compute absolute time range for the trim region
       let trimBuf;
       if (cand.buffer) {
         const dur = cand.buffer.duration;
@@ -370,6 +552,7 @@ function playCandidate(slot, id, cand, when, volScale=1.0, cellPitch=0) {
         trimBuf = audioCtx.createBuffer(nCh, len, sr);
         for (let ch = 0; ch < nCh; ch++) trimBuf.copyToChannel(slot.sourceBuffer.getChannelData(ch).subarray(s0, s1), ch);
       }
+      if (isReversed) reverseBuffer(trimBuf);
       pitchedBuf = renderPitchedBuffer(trimBuf, semitones, speed);
       _pitchedBufferCache[cacheKey] = pitchedBuf;
     }
@@ -377,6 +560,24 @@ function playCandidate(slot, id, cand, when, volScale=1.0, cellPitch=0) {
     if (cand.buffer) {
       src.connect(dest);
     } else {
+      const normGain = audioCtx.createGain(); normGain.gain.value = cand.normGain ?? 1.0;
+      src.connect(normGain); normGain.connect(dest);
+    }
+    src.start(when);
+  } else if (isReversed) {
+    // Reverse requires extracting the trimmed segment into a new buffer
+    let revBuf;
+    if (cand.buffer) {
+      const dur = cand.buffer.duration;
+      revBuf = extractSegment(cand.buffer, ts * dur, (te - ts) * dur);
+      src.buffer = reverseBuffer(revBuf); src.connect(dest);
+    } else {
+      if (!slot.sourceBuffer) return;
+      const ctxDur = (cand.ctxEnd || 1) - (cand.ctxStart || 0);
+      const offset = (cand.ctxStart || 0) + ts * ctxDur;
+      const duration = (te - ts) * ctxDur;
+      revBuf = extractSegment(slot.sourceBuffer, offset, duration);
+      src.buffer = reverseBuffer(revBuf);
       const normGain = audioCtx.createGain(); normGain.gain.value = cand.normGain ?? 1.0;
       src.connect(normGain); normGain.connect(dest);
     }
@@ -396,7 +597,7 @@ function playCandidate(slot, id, cand, when, volScale=1.0, cellPitch=0) {
     src.start(when,offset,duration);
   }
   // Track active sound for live parameter updates
-  const entry = { src, volGain, eqLo, eqMd, eqHi, volScale, slotIdx: si, wsola: needWSola };
+  const entry = { src, volGain, volScale, slotIdx: si, wsola: needWSola };
   if (!_activeSounds[id]) _activeSounds[id] = [];
   _activeSounds[id].push(entry);
   src.onended = () => {
@@ -414,9 +615,10 @@ function triggerDrumAtTime(slot, id, when, cellPitch=0, step=-1) {
     const si = slots.indexOf(slot);
     const ts=slot.drumTrimStart[id]??0, te=slot.drumTrimEnd[id]??1;
     const baseSemitones = slot.drumPitch[id] ?? 0;
+    const fineTune = (slot.drumFineTune[id] ?? 0) / 100;
     const linked = slot.drumPitchSpeedLinked[id] ?? true;
     const forceWSola = cellPitch !== 0;
-    const speed = (linked && !forceWSola) ? Math.pow(2, (baseSemitones + cellPitch)/12) : (slot.drumSpeed[id] ?? 1.0);
+    const speed = (linked && !forceWSola) ? Math.pow(2, (baseSemitones + fineTune + cellPitch)/12) : (slot.drumSpeed[id] ?? 1.0);
     let clipDurSec;
     if (cand.buffer) {
       clipDurSec = cand.buffer.duration * (te - ts);
@@ -441,18 +643,12 @@ function updateLiveVolume(slotIdx, id) {
 
 function updateLiveEQ(slotIdx, id) {
   const slot = slots[slotIdx]; if (!slot) return;
-  const eq = slot.drumEQ[id] || { low: 0, mid: 0, high: 0 };
-  for (const e of (_activeSounds[id] || []))
-    if (e.slotIdx === slotIdx && e.eqLo) {
-      e.eqLo.gain.value = eq.low;
-      e.eqMd.gain.value = eq.mid;
-      e.eqHi.gain.value = eq.high;
-    }
+  updateEQParams(id, slot);
 }
 
 function updateLivePitch(slotIdx, id) {
   const slot = slots[slotIdx]; if (!slot) return;
-  const semitones = slot.drumPitch[id] ?? 0;
+  const semitones = (slot.drumPitch[id] ?? 0) + (slot.drumFineTune[id] ?? 0) / 100;
   const linked = slot.drumPitchSpeedLinked[id] ?? true;
   if (!linked) return;
   const rate = Math.pow(2, semitones / 12);
@@ -479,6 +675,12 @@ function triggerMelodyNote(slot, noteId) {
   const cellPitch = noteIdx - MELODY_CENTER;
   playCandidate(slot, soundId, cand, 0, slot.gridVolume ?? 1.0, cellPitch);
   padFlash[noteId] = millis();
+  // Compute flash duration from clip length
+  const ts = slot.drumTrimStart[soundId] ?? 0, te = slot.drumTrimEnd[soundId] ?? 1;
+  let clipDur;
+  if (cand.buffer) clipDur = cand.buffer.duration * (te - ts);
+  else clipDur = ((cand.ctxEnd || 1) - (cand.ctxStart || 0)) * (te - ts);
+  _padFlashDur[noteId] = clipDur * 1000;
 }
 
 function scheduleMetronomeClick(when, isDownbeat) {
@@ -530,6 +732,7 @@ function audioBufferToWav(buffer, startSec, endSec) {
 }
 
 async function openTrimmer(blob, buffer) {
+  trimStemMode = 'full';
   trimState = {
     blob, buffer,
     fileName: blob.name || 'mic recording',
@@ -541,7 +744,7 @@ async function openTrimmer(blob, buffer) {
   setPhase('trimming');
 }
 
-function confirmTrim() {
+async function confirmTrim() {
   if (!trimState) return;
   if (trimState.mode === 'customClip') { confirmCustomClip(); return; }
   stopTrimPreview();
@@ -550,9 +753,35 @@ function confirmTrim() {
   const wav = audioBufferToWav(buffer, trimStart, trimStart + safeDur);
   const baseName = fileName.replace(/\.[^.]+$/, '') || 'audio';
   const wavFile = new File([wav], baseName+'.wav', {type:'audio/wav'});
+  const stemMode = trimStemMode;
+  const slotIdx = selectedSlotIdx;  // capture before async — user may switch slots
   trimState = null;
+  trimStemMode = 'full';
   setPhase('ready');
-  submitAudio(wavFile);
+
+  if (stemMode !== 'full') {
+    const slot = slots[slotIdx];
+    slot.stemMode = stemMode;
+    slot.analyzing = true;
+    slot.fileName = (fileName || 'audio').replace(/\.[^.]+$/, '') + ' [' + stemMode.toUpperCase() + ']';
+    const sepForm = new FormData();
+    sepForm.append('file', wavFile);
+    sepForm.append('stem', stemMode);
+    try {
+      const resp = await fetch(`${BACKEND}/separate`, {method:'POST', body: sepForm});
+      if (!resp.ok) { const e = await resp.json().catch(()=>({detail:resp.statusText})); throw new Error(e.detail||resp.statusText); }
+      const stemBlob = await resp.blob();
+      const stemFile = new File([stemBlob], baseName+'_'+stemMode+'.wav', {type:'audio/wav'});
+      submitAudio(stemFile, slotIdx);
+    } catch(e) {
+      slot.analyzing = false;
+      errorMsg = 'Stem separation failed: ' + e.message;
+      setPhase('error');
+    }
+  } else {
+    slots[slotIdx].stemMode = null;
+    submitAudio(wavFile, slotIdx);
+  }
 }
 
 function stopTrimPreview() {
@@ -582,20 +811,22 @@ function stopRecording() {
 
 function onRecordingStop() {
   const blob=new Blob(recChunks,{type:'audio/webm'});
+  const slotIdx = selectedSlotIdx;
   setPhase('ready');
-  blob.arrayBuffer().then(ab=>audioCtx.decodeAudioData(ab).then(buf=>openTrimmer(blob,buf)).catch(()=>submitAudio(blob)));
+  blob.arrayBuffer().then(ab=>audioCtx.decodeAudioData(ab).then(buf=>openTrimmer(blob,buf)).catch(()=>submitAudio(blob,slotIdx)));
 }
 
 function onFileSelected() {
   const file=uploadEl.elt.files[0]; if(!file) return;
   uploadEl.elt.value='';
-  file.arrayBuffer().then(ab=>audioCtx.decodeAudioData(ab.slice(0)).then(buf=>openTrimmer(file,buf)).catch(()=>submitAudio(file)));
+  const slotIdx = selectedSlotIdx;
+  file.arrayBuffer().then(ab=>audioCtx.decodeAudioData(ab.slice(0)).then(buf=>openTrimmer(file,buf)).catch(()=>submitAudio(file,slotIdx)));
 }
 
-async function submitAudio(blob) {
+async function submitAudio(blob, targetSlotIdx) {
   if (!blob) return;
   if (phase==='recording') setPhase('ready');
-  const slot=currentSlot();
+  const slot = targetSlotIdx != null ? slots[targetSlotIdx] : currentSlot();
   slot.fileName = blob.name || 'mic recording';
   const arrayBuf=await blob.arrayBuffer();
   const newSourceBuffer=await audioCtx.decodeAudioData(arrayBuf.slice(0));
@@ -880,6 +1111,7 @@ async function saveSession() {
       index: si,
       type: slot.type || 'drum',
       fileName: slot.fileName,
+      stemMode: slot.stemMode || null,
       sourceWavPath: null,
       melodyOctave: slot.melodyOctave,
       melodySoundPadId: slot.melodySoundPadId,
@@ -923,12 +1155,16 @@ async function saveSession() {
         inputText: slot.padText[id] || '',
         volume: slot.drumVolumes[id] ?? 0.8,
         pitch: slot.drumPitch[id] ?? 0,
+        fineTune: slot.drumFineTune[id] ?? 0,
         trimStart: slot.drumTrimStart[id] ?? 0,
         trimEnd: slot.drumTrimEnd[id] ?? 1,
         eq: slot.drumEQ[id] || { low: 0, mid: 0, high: 0 },
         speed: slot.drumSpeed[id] ?? 1.0,
         pitchSpeedLinked: slot.drumPitchSpeedLinked[id] ?? true,
         candidateIdx: slot.drumIdx[id] ?? 0,
+        reverse: slot.drumReverse[id] ?? false,
+        reverb: slot.drumReverb[id] || { size: 0.3, damping: 0.5, mix: 0 },
+        delay: slot.drumDelay[id] || { time: 250, feedback: 0.3, mix: 0 },
         recLabels: [],
         recordWavPath: null,
       };
@@ -1036,6 +1272,7 @@ async function loadSession() {
     const sd = manifest.slots[si];
     const slot = createSlot(sd.type || 'drum');
     slot.fileName = sd.fileName;
+    slot.stemMode = sd.stemMode || null;
     if (slot.type === 'melody') {
       slot.melodyOctave = sd.melodyOctave ?? 2;
       slot.melodySoundPadId = sd.melodySoundPadId ?? 'pad_0';
@@ -1080,6 +1317,7 @@ async function loadSession() {
       slot.padFinalized[id] = pd.finalized;
       slot.drumVolumes[id] = pd.volume;
       slot.drumPitch[id] = pd.pitch;
+      slot.drumFineTune[id] = pd.fineTune ?? 0;
       const sDur = slot.sourceBuffer ? slot.sourceBuffer.duration : 0;
       const { ts: remappedTs, te: remappedTe } = remapSavedTrim(pd, sDur);
       slot.drumTrimStart[id] = remappedTs;
@@ -1089,9 +1327,17 @@ async function loadSession() {
       // Backward compat: old files have preserveTempo; convert to unlinked
       slot.drumPitchSpeedLinked[id] = pd.pitchSpeedLinked ?? (pd.preserveTempo ? false : true);
       slot.drumIdx[id] = pd.candidateIdx;
+      slot.drumReverse[id] = pd.reverse ?? false;
+      slot.drumReverb[id] = pd.reverb || { size: 0.3, damping: 0.5, mix: 0 };
+      slot.drumDelay[id] = pd.delay || { time: 250, feedback: 0.3, mix: 0 };
 
       _addPadToSlot(slot, def);
       slot.padText[id] = pd.inputText || '';
+
+      // Restore effect node parameters from saved state
+      if (typeof updateEQParams === 'function') updateEQParams(id, slot);
+      if (typeof updateReverbParams === 'function') updateReverbParams(id, slot);
+      if (typeof updateDelayParams === 'function') updateDelayParams(id, slot);
 
       // Restore saved candidates immediately (enables playback before analysis)
       if (pd.mode === 'record' && pd.recordWavPath) {

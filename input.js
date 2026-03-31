@@ -267,7 +267,9 @@ function onSlotHeaderClick() {
     const humHandleX=L.humSliderX+(slot.humanize??0)*L.humSliderW;
     // CLR standalone button
     if (mX()>=L.clrX&&mX()<L.clrX+L.standaloneW&&abs(screenMid-mY())<L.btnH/2+2) {
-      const ec=editCells(slots[slotIndex]); getActivePads(slots[slotIndex]).forEach(drum=>{if(ec[drum.id])ec[drum.id].fill(false);}); return true;
+      const ec=editCells(slots[slotIndex]);
+      Object.keys(ec).forEach(k=>{if(ec[k])ec[k].fill(false);});
+      return true;
     }
     // DUP standalone button
     if (mX()>=L.dupX&&mX()<L.dupX+L.standaloneW&&abs(screenMid-mY())<L.btnH/2+2) {
@@ -646,6 +648,14 @@ function onControlPanelClick() {
       return true;
     }
 
+    // Fine tune slider handle
+    const fineNorm = ((slot.drumFineTune[def.id]??0)+50)/100;
+    const fineHandleX = C.sliderX + fineNorm * C.sliderW;
+    if (abs(mX()-fineHandleX)<6 && abs(mY()-C.fineSliderY)<8) {
+      drag = {type: 'panelSlider', param: 'fine', id: def.id, slotIdx: selectedSlotIdx, sldX: C.sliderX, sldW: C.sliderW};
+      return true;
+    }
+
     // Chain link toggle
     {
       const chainCx = C.chainX;
@@ -655,7 +665,7 @@ function onControlPanelClick() {
         if (linked) {
           slot.drumSpeed[def.id] = 1.0;
         } else {
-          slot.drumSpeed[def.id] = Math.pow(2, (slot.drumPitch[def.id]??0)/12);
+          slot.drumSpeed[def.id] = Math.pow(2, ((slot.drumPitch[def.id]??0)+(slot.drumFineTune[def.id]??0)/100)/12);
         }
         invalidatePitchedCache(selectedSlotIdx, def.id);
         return true;
@@ -665,11 +675,39 @@ function onControlPanelClick() {
     // Speed slider handle (always interactive — when linked, drags pitch in 12 increments)
     {
       const linked = slot.drumPitchSpeedLinked[def.id] ?? true;
-      const speedVal = linked ? Math.pow(2, (slot.drumPitch[def.id]??0)/12) : (slot.drumSpeed[def.id] ?? 1.0);
+      const speedVal = linked ? Math.pow(2, ((slot.drumPitch[def.id]??0)+(slot.drumFineTune[def.id]??0)/100)/12) : (slot.drumSpeed[def.id] ?? 1.0);
       const speedNorm = speedToNorm(speedVal);
       const speedHandleX = C.sliderX + speedNorm * C.sliderW;
       if (abs(mX()-speedHandleX)<6 && abs(mY()-C.speedSliderY)<8) {
         drag = {type: 'panelSlider', param: 'speed', id: def.id, slotIdx: selectedSlotIdx, sldX: C.sliderX, sldW: C.sliderW, linked};
+        return true;
+      }
+    }
+  }
+
+  // Effects box — reverse toggle + knob drags
+  if (isMappedEarly) {
+    const fx = fxBoxLayout(C);
+    // Reverse toggle
+    if (mX() > fx.revX && mX() < fx.revX + fx.revW && mY() > fx.revY && mY() < fx.revY + fx.revH) {
+      slot.drumReverse[def.id] = !slot.drumReverse[def.id];
+      invalidatePitchedCache(selectedSlotIdx, def.id);
+      return true;
+    }
+    // Knob drags
+    const knobParams = [
+      { key: 'reverbSize', get: () => (slot.drumReverb[def.id]||{}).size ?? 0.3, min: 0, max: 1 },
+      { key: 'reverbDamping', get: () => (slot.drumReverb[def.id]||{}).damping ?? 0.5, min: 0, max: 1 },
+      { key: 'reverbMix', get: () => (slot.drumReverb[def.id]||{}).mix ?? 0, min: 0, max: 1 },
+      { key: 'delayTime', get: () => (slot.drumDelay[def.id]||{}).time ?? 250, min: 10, max: 1000 },
+      { key: 'delayFeedback', get: () => (slot.drumDelay[def.id]||{}).feedback ?? 0.3, min: 0, max: 0.95 },
+      { key: 'delayMix', get: () => (slot.drumDelay[def.id]||{}).mix ?? 0, min: 0, max: 1 },
+    ];
+    for (const kp of knobParams) {
+      const k = fx.knobs[kp.key];
+      if (dist(mX(), mY(), k.cx, k.cy) < fx.knobR + 3) {
+        drag = { type: 'fxKnob', param: kp.key, id: def.id, slotIdx: selectedSlotIdx,
+                 startY: mY(), startVal: kp.get(), min: kp.min, max: kp.max };
         return true;
       }
     }
@@ -746,13 +784,13 @@ function onControlPanelClick() {
     iconCurX += iconW;
   }
 
-  // Duplicate icon — only clickable when mapped and unmapped pad available
+  // Duplicate icon — only clickable when mapped and unmapped pad available (disabled for melody)
   {
     const cx = iconCurX + iconW / 2;
     const unmappedPadId = slot.activePadIds.find(pid =>
       pid !== def.id && !slot.padMode[pid] && !(slot.drumCandidates[pid] && slot.drumCandidates[pid].length > 0)
     );
-    if (isMapped && unmappedPadId && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
+    if (slot.type !== 'melody' && isMapped && unmappedPadId && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
       // Duplicate this pad's settings to the leftmost unmapped pad
       const srcId = def.id;
       slot.padMode[unmappedPadId] = slot.padMode[srcId];
@@ -764,27 +802,34 @@ function onControlPanelClick() {
       slot.drumTrimEnd[unmappedPadId] = slot.drumTrimEnd[srcId] ?? 1;
       slot.drumVolumes[unmappedPadId] = slot.drumVolumes[srcId] ?? 0.8;
       slot.drumPitch[unmappedPadId] = slot.drumPitch[srcId] ?? 0;
+      slot.drumFineTune[unmappedPadId] = slot.drumFineTune[srcId] ?? 0;
       slot.drumSpeed[unmappedPadId] = slot.drumSpeed[srcId] ?? 1.0;
       slot.drumPitchSpeedLinked[unmappedPadId] = slot.drumPitchSpeedLinked[srcId] ?? true;
       slot.drumEQ[unmappedPadId] = {...(slot.drumEQ[srcId] || { low: 0, mid: 0, high: 0 })};
+      slot.drumReverse[unmappedPadId] = slot.drumReverse[srcId] ?? false;
+      slot.drumReverb[unmappedPadId] = {...(slot.drumReverb[srcId] || { size: 0.3, damping: 0.5, mix: 0 })};
+      slot.drumDelay[unmappedPadId] = {...(slot.drumDelay[srcId] || { time: 250, feedback: 0.3, mix: 0 })};
+      if (typeof updateEQParams === 'function') updateEQParams(unmappedPadId, slot);
+      if (typeof updateReverbParams === 'function') updateReverbParams(unmappedPadId, slot);
+      if (typeof updateDelayParams === 'function') updateDelayParams(unmappedPadId, slot);
       syncSharedInput(); positionSharedInput();
       return true;
     }
     iconCurX += iconW;
   }
 
-  // Trash icon — only clickable when mapped
+  // Trash icon — only clickable when mapped (disabled for melody)
   {
     const cx = iconCurX + iconW / 2;
-    if (isMapped && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
+    if (slot.type !== 'melody' && isMapped && abs(mX()-cx)<iconW/2+2 && abs(mY()-iconCy)<inputH/2) {
       clearPad(def.id);
       return true;
     }
     iconCurX += iconW;
   }
 
-  // X inside text input (when finalized) — clears text and unmaps
-  if (finalized && padText) {
+  // X inside text input (when finalized) — clears text and unmaps (not for melody)
+  if (slot.type !== 'melody' && finalized && padText) {
     const xX = inputX + inputW - 10;
     const xY = inputY + inputH/2;
     if (dist(mX(), mY(), xX, xY) < 7) {
@@ -857,7 +902,18 @@ function mousePressed() {
     }
     const btnY=wfY+wfH+28, btnH=22;
     if (mY()>btnY&&mY()<btnY+btnH) {
-      if (mX()>wfX&&mX()<wfX+60) { stopTrimPreview(); trimState=null; setPhase('ready'); return; }
+      if (mX()>wfX&&mX()<wfX+60) { stopTrimPreview(); trimState=null; trimStemMode='full'; setPhase('ready'); return; }
+      // Stem toggle capsule
+      if (!trimState.mode) {
+        const canRight=wfX+60, playLeft=cW()/2-32;
+        const gap=playLeft-canRight, capsW=Math.min(gap-16,150);
+        const capsX=canRight+(gap-capsW)/2, cellW=capsW/3;
+        const stemValues=['full','vocals','drums'];
+        if (mX()>capsX&&mX()<capsX+capsW) {
+          const idx=Math.floor((mX()-capsX)/cellW);
+          if (idx>=0&&idx<3) { trimStemMode=stemValues[idx]; return; }
+        }
+      }
       const playBtnW=64, playBtnX=cW()/2-32;
       if (mX()>playBtnX&&mX()<playBtnX+playBtnW) {
         if (trimPlaySrc) { stopTrimPreview(); }
@@ -940,6 +996,19 @@ function mouseDragged() {
     const ec=editCells(slot); for (let i=lo;i<=hi;i++) { if (!ec[drag.drumId]) ec[drag.drumId]=new Array(grid.steps).fill(false); ec[drag.drumId][i]=drag.value; if(!drag.value&&slot.type!=='melody'){const ecp=editCellPitch(slot);if(ecp[drag.drumId])ecp[drag.drumId][i]=0;} }
     drag.lastS=stepIdx; return;
   }
+  if (drag.type==='fxKnob') {
+    const dy = drag.startY - mY();
+    const range = drag.max - drag.min;
+    const newVal = constrain(drag.startVal + dy / 80 * range, drag.min, drag.max);
+    const slot = slots[drag.slotIdx || selectedSlotIdx];
+    if (drag.param === 'reverbSize') { slot.drumReverb[drag.id].size = newVal; }
+    else if (drag.param === 'reverbDamping') { slot.drumReverb[drag.id].damping = newVal; }
+    else if (drag.param === 'reverbMix') { slot.drumReverb[drag.id].mix = newVal; if (typeof updateReverbMix === 'function') updateReverbMix(drag.id, slot); }
+    else if (drag.param === 'delayTime') { slot.drumDelay[drag.id].time = Math.round(newVal); if (typeof updateDelayParams === 'function') updateDelayParams(drag.id, slot); }
+    else if (drag.param === 'delayFeedback') { slot.drumDelay[drag.id].feedback = newVal; if (typeof updateDelayParams === 'function') updateDelayParams(drag.id, slot); }
+    else if (drag.param === 'delayMix') { slot.drumDelay[drag.id].mix = newVal; if (typeof updateDelayParams === 'function') updateDelayParams(drag.id, slot); }
+    return;
+  }
   if (drag.type==='dial') {
     const dy=drag.startY-mY();
     const slot=slots[drag.slotIdx||selectedSlotIdx];
@@ -952,6 +1021,7 @@ function mouseDragged() {
     const si=drag.slotIdx||selectedSlotIdx;
     if (drag.param==='vol') { slot.drumVolumes[drag.id]=frac; updateLiveVolume(si, drag.id); }
     else if (drag.param==='pitch') { slot.drumPitch[drag.id]=Math.round(frac*24-12); updateLivePitch(si, drag.id); }
+    else if (drag.param==='fine') { slot.drumFineTune[drag.id]=Math.round(frac*100-50); updateLivePitch(si, drag.id); }
     else if (drag.param==='speed') {
       if (drag.linked) {
         const semitones = Math.round(normToSpeed(frac) > 0 ? 12 * Math.log2(normToSpeed(frac)) : 0);
@@ -1049,8 +1119,15 @@ function mouseReleased() {
     slot.drumTrimEnd[drag.id]=drag.proposedEnd??drag.origEnd;
     updateTrimLabel(slot, drag.id);
   }
-  if (drag&&drag.type==='panelSlider'&&(drag.param==='pitch'||drag.param==='speed')) {
+  if (drag&&drag.type==='panelSlider'&&(drag.param==='pitch'||drag.param==='fine'||drag.param==='speed')) {
     invalidatePitchedCache(drag.slotIdx, drag.id);
+  }
+  if (drag&&drag.type==='fxKnob') {
+    // Regenerate reverb IR on release for size/damping changes (expensive, throttled)
+    if ((drag.param==='reverbSize'||drag.param==='reverbDamping') && typeof updateReverbParams === 'function') {
+      const fxSlot = slots[drag.slotIdx || selectedSlotIdx];
+      updateReverbParams(drag.id, fxSlot);
+    }
   }
   if (drag&&drag.type==='reorderMeasure') {
     if (drag.targetIdx!==undefined&&drag.targetIdx!==drag.fromIdx) {
@@ -1172,11 +1249,22 @@ function doubleClicked() {
   if (mX()>C.sliderX-4 && mX()<C.sliderX+C.sliderW+4) {
     if (abs(mY()-C.volSliderY)<10) { slot.drumVolumes[def.id]=0.8; updateLiveVolume(selectedSlotIdx, def.id); return; }
     if (abs(mY()-C.pitchSliderY)<10) { slot.drumPitch[def.id]=0; updateLivePitch(selectedSlotIdx, def.id); invalidatePitchedCache(selectedSlotIdx, def.id); return; }
+    if (abs(mY()-C.fineSliderY)<10) { slot.drumFineTune[def.id]=0; updateLivePitch(selectedSlotIdx, def.id); invalidatePitchedCache(selectedSlotIdx, def.id); return; }
     if (abs(mY()-C.speedSliderY)<10) {
       if (slot.drumPitchSpeedLinked[def.id]??true) { slot.drumPitch[def.id]=0; updateLivePitch(selectedSlotIdx, def.id); }
       else { slot.drumSpeed[def.id]=1.0; }
       invalidatePitchedCache(selectedSlotIdx, def.id); return;
     }
+  }
+  // Double-click on effects box resets all effects
+  if (mX()>C.fxBoxX && mX()<C.fxBoxX+C.fxBoxW && mY()>C.fxBoxY && mY()<C.fxBoxY+C.fxBoxH) {
+    slot.drumReverse[def.id] = false;
+    slot.drumReverb[def.id] = { size: 0.3, damping: 0.5, mix: 0 };
+    slot.drumDelay[def.id] = { time: 250, feedback: 0.3, mix: 0 };
+    if (typeof updateReverbParams === 'function') updateReverbParams(def.id, slot);
+    if (typeof updateDelayParams === 'function') updateDelayParams(def.id, slot);
+    invalidatePitchedCache(selectedSlotIdx, def.id);
+    return;
   }
   // Double-click on inline EQ graph resets EQ to flat
   if (mX()>C.eqGraphX && mX()<C.eqGraphX+C.eqGraphW && mY()>C.eqGraphY && mY()<C.eqGraphY+C.eqGraphH) {
